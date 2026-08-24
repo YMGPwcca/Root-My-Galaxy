@@ -34,6 +34,10 @@ object AppPreferences {
     private const val THEME_MODE = "theme_mode"
     private const val ADVANCED_MODE = "advanced_mode"
     private const val SHIZUKU_MODE = "shizuku_mode"
+    private const val AUTO_APPLY_MODULES = "auto_apply_modules"
+    private const val AUTO_ROOT_BOOT = "auto_root_boot"
+    private const val ADB_PAIRED = "adb_paired"
+    private const val BOOT_RETRY_COUNT = "boot_retry_count"
     private const val CONSUMED_INSTALL_REQUEST = "consumed_install_request"
 
     fun accentColor(context: Context): AccentColor = AccentColor.fromStoredValue(
@@ -71,6 +75,42 @@ object AppPreferences {
     fun setShizukuMode(context: Context, enabled: Boolean) {
         prefs(context).edit()
             .putBoolean(SHIZUKU_MODE, enabled)
+            .apply()
+    }
+
+    fun autoApplyModules(context: Context): Boolean =
+        prefs(context).getBoolean(AUTO_APPLY_MODULES, false)
+
+    fun setAutoApplyModules(context: Context, enabled: Boolean) {
+        prefs(context).edit()
+            .putBoolean(AUTO_APPLY_MODULES, enabled)
+            .apply()
+    }
+
+    fun autoRootOnBoot(context: Context): Boolean =
+        prefs(context).getBoolean(AUTO_ROOT_BOOT, false)
+
+    fun setAutoRootOnBoot(context: Context, enabled: Boolean) {
+        prefs(context).edit()
+            .putBoolean(AUTO_ROOT_BOOT, enabled)
+            .apply()
+    }
+
+    fun adbPaired(context: Context): Boolean =
+        prefs(context).getBoolean(ADB_PAIRED, false)
+
+    fun setAdbPaired(context: Context, paired: Boolean) {
+        prefs(context).edit()
+            .putBoolean(ADB_PAIRED, paired)
+            .apply()
+    }
+
+    fun bootRetryCount(context: Context): Int =
+        prefs(context).getInt(BOOT_RETRY_COUNT, 0)
+
+    fun setBootRetryCount(context: Context, count: Int) {
+        prefs(context).edit()
+            .putInt(BOOT_RETRY_COUNT, count)
             .apply()
     }
 

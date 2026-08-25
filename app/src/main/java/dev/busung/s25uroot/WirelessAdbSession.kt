@@ -118,7 +118,11 @@ class WirelessAdbSession private constructor(
          * connect port, and authenticates. Throws if the session cannot be
          * established — callers treat this as the "wireless ADB required" gate.
          */
-        fun open(context: Context, portDiscoveryTimeoutMs: Long = 60_000): WirelessAdbSession {
+        fun open(
+            context: Context,
+            portDiscoveryTimeoutMs: Long = 60_000,
+            depth: Int = 0,
+        ): WirelessAdbSession {
             val keyManager = AdbKeyManager(context)
 
             // Fast path: stable adbTCP on port 5555, enabled by a previous
@@ -187,9 +191,14 @@ class WirelessAdbSession private constructor(
                     }
                     Thread.sleep(1_000)
                 }
-                // 5555 never answered (dialog denied/ignored): rebuild wADB.
-                Log.w(TAG, "tcpip upgrade failed - re-bringing up wireless debugging")
-                return open(context, portDiscoveryTimeoutMs)
+                // 5555 never answered (dialog denied/ignored): rebuild
+                // wireless debugging — exactly ONE extra attempt, then give
+                // up instead of cycling forever.
+                if (depth == 0) {
+                    Log.w(TAG, "tcpip upgrade failed - re-bringing up wireless debugging")
+                    return open(context, portDiscoveryTimeoutMs, depth = 1)
+                }
+                error("adbd did not come up on TCP 5555 and the wireless debugging re-bootstrap was already tried once")
             }
             return WirelessAdbSession(client)
         }

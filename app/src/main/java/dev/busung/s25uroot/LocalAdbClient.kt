@@ -293,19 +293,24 @@ class LocalAdbClient(
 
         when (message.command) {
             A_OKAY -> {
+                // The remote id is constant for the whole stream; capture
+                // it once so timeout paths can close the remote command.
+                val streamRemoteId = message.arg0
                 while (true) {
                     val now = System.currentTimeMillis()
                     if (now > deadline) {
                         Log.w(TAG, "shellStreaming overall timeout reached")
+                        runCatching { write(A_CLSE, localId, streamRemoteId) }
                         break
                     }
                     if (now - lastOutputAt > stallTimeoutMs) {
                         Log.w(TAG, "shellStreaming stall timeout reached")
+                        runCatching { write(A_CLSE, localId, streamRemoteId) }
                         break
                     }
                     if (shouldStop()) {
                         Log.d(TAG, "shellStreaming: early stop requested")
-                        write(A_CLSE, localId, message.arg0)
+                        write(A_CLSE, localId, streamRemoteId)
                         break
                     }
                     // Poll the reader queue with a short timeout so we can
@@ -317,7 +322,6 @@ class LocalAdbClient(
                     } catch (e: SocketTimeoutException) {
                         continue
                     }
-                    val remoteId = message.arg0
                     if (message.command == A_WRTE) {
                         if (message.data != null && message.data.isNotEmpty()) {
                             val chunk = String(message.data)
@@ -325,9 +329,9 @@ class LocalAdbClient(
                             onOutput(chunk)
                             lastOutputAt = System.currentTimeMillis()
                         }
-                        write(A_OKAY, localId, remoteId)
+                        write(A_OKAY, localId, streamRemoteId)
                     } else if (message.command == A_CLSE) {
-                        write(A_CLSE, localId, remoteId)
+                        write(A_CLSE, localId, streamRemoteId)
                         break
                     } else if (message.command == A_OKAY) {
                         // Benign flow-control ack; nothing to do.

@@ -88,7 +88,14 @@ data class SupportManifest(
                             kernelVersions = payload.getJSONArray("kernelVersions").strings(),
                             exploit = parseArtifact(payload.getJSONObject("exploit")),
                             kernelSu = parseArtifact(payload.getJSONObject("kernelsu")),
-                            slideSource = payload.optString("slideSource").takeIf { it.isNotEmpty() },
+                            slideSource = payload.optString("slideSource").takeIf { it.isNotEmpty() }.also {
+                                // Fail closed: an unknown slide source must
+                                // reject the profile instead of silently
+                                // running it from the wrong context.
+                                require(it == null || it.equals("tracefs", ignoreCase = true)) {
+                                    "Unsupported slideSource '$it' in profile ${payload.getString("payloadId")}"
+                                }
+                            },
                         ),
                     )
                 }

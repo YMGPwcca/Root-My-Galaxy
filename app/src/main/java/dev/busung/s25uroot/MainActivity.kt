@@ -80,6 +80,9 @@ import androidx.compose.material.icons.rounded.Memory
 import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.PowerSettingsNew
+import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Schedule
@@ -1420,6 +1423,23 @@ private fun SettingsPage(
     var showColorDialog by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
     var showShizukuMissingDialog by remember { mutableStateOf(false) }
+    var showAdbPairingDialog by remember { mutableStateOf(false) }
+    // Reactive state so the switches recompose immediately on toggle.
+    var autoApplyModules by remember { mutableStateOf(AppPreferences.autoApplyModules(context)) }
+    var autoRootOnBoot by remember { mutableStateOf(AppPreferences.autoRootOnBoot(context)) }
+    var adbPaired by remember { mutableStateOf(AppPreferences.adbPaired(context)) }
+    // Truth probe: the stored flag is a guess; only adbd knows if our key
+    // is still trusted (a phone-side revoke leaves the guess stale). Every
+    // Settings visit re-tests and rewrites the verdict.
+    LaunchedEffect(Unit) {
+        launch(kotlinx.coroutines.Dispatchers.IO) {
+            val verdict = WirelessAdbSession.probePairing(context)
+            if (verdict != null && verdict != AppPreferences.adbPaired(context)) {
+                AppPreferences.setAdbPaired(context, verdict)
+                adbPaired = verdict
+            }
+        }
+    }
     var languageMenuTop by remember { mutableStateOf(32.dp) }
     var colorMenuTop by remember { mutableStateOf(32.dp) }
     val density = LocalDensity.current
@@ -1449,6 +1469,84 @@ private fun SettingsPage(
                     showShizukuMissingDialog = false
                 }) {
                     Text(stringResource(R.string.action_cancel))
+                }
+            },
+        )
+    }
+
+    if (showAdbPairingDialog) {
+        // Refresh pairing status each time the dialog is (re)composed.
+        LaunchedEffect(Unit) { adbPaired = AppPreferences.adbPaired(context) }
+        val paired = adbPaired
+        AlertDialog(
+            onDismissRequest = { showAdbPairingDialog = false },
+            icon = { Icon(Icons.Rounded.Wifi, contentDescription = null) },
+            title = {
+                DialogDimAmount(0.34f)
+                Text(stringResource(R.string.adb_pair_title))
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(stringResource(R.string.adb_pair_instructions))
+                    Text(
+                        text = if (paired) {
+                            stringResource(R.string.adb_pair_status_paired)
+                        } else {
+                            stringResource(R.string.adb_pair_status_not_paired)
+                        },
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (paired) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.error
+                        },
+                    )
+                }
+            },
+            confirmButton = {
+                FilledTonalButton(onClick = {
+                    clickHaptic(view)
+                    showAdbPairingDialog = false
+                    // Phone-side forget leaves this flag stale; every fresh
+                    // pair attempt starts from "not paired".
+                    AppPreferences.setAdbPaired(context, false)
+                    adbPaired = false
+                    // Jump straight to the system Wireless debugging page —
+                    // the pairing offer (and its 6-digit code) only exists
+                    // while that screen is open. Hidden action string; fall
+                    // back to Developer options when unresolvable.
+                    runCatching {
+                        context.startActivity(
+                            Intent("android.settings.WIRELESS_DEBUGGING_SETTINGS")
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }.onFailure {
+                        runCatching {
+                            context.startActivity(
+                                Intent(android.provider.Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                            )
+                        }
+                    }
+                    context.startForegroundService(AdbPairingService.startIntent(context))
+                    scope.launch {
+                        repeat(60) {
+                            kotlinx.coroutines.delay(1000)
+                            val nowPaired = AppPreferences.adbPaired(context)
+                            if (nowPaired != adbPaired) adbPaired = nowPaired
+                            if (nowPaired) return@launch
+                        }
+                    }
+                }) {
+                    Text(stringResource(R.string.adb_pair_button))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    clickHaptic(view)
+                    showAdbPairingDialog = false
+                }) {
+                    Text(stringResource(R.string.action_close))
                 }
             },
         )
@@ -1573,6 +1671,50 @@ private fun SettingsPage(
                     onAdvancedModeChanged(it)
                 },
             )
+        }
+        item { SectionLabel(stringResource(R.string.section_root_on_boot)) }
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                SettingsSwitchCard(
+                    icon = Icons.Rounded.Refresh,
+                    title = stringResource(R.string.pref_auto_apply_modules),
+                    description = stringResource(R.string.pref_auto_apply_modules_summary),
+                    checked = autoApplyModules,
+                    position = SettingsCardPosition.Top,
+                    onCheckedChange = { enabled ->
+                        clickHaptic(view)
+                        autoApplyModules = enabled
+                        AppPreferences.setAutoApplyModules(context, enabled)
+                    },
+                )
+                SettingsSwitchCard(
+                    icon = Icons.Rounded.PowerSettingsNew,
+                    title = stringResource(R.string.pref_auto_root_boot),
+                    description = stringResource(R.string.pref_auto_root_boot_summary),
+                    checked = autoRootOnBoot,
+                    position = SettingsCardPosition.Middle,
+                    onCheckedChange = { enabled ->
+                        clickHaptic(view)
+                        autoRootOnBoot = enabled
+                        AppPreferences.setAutoRootOnBoot(context, enabled)
+                    },
+                )
+                SettingsCard(
+                    icon = Icons.Rounded.Wifi,
+                    title = stringResource(R.string.pref_adb_pairing),
+                    description = stringResource(R.string.pref_adb_pairing_summary),
+                    value = if (adbPaired) {
+                        stringResource(R.string.adb_pair_status_paired)
+                    } else {
+                        stringResource(R.string.adb_pair_status_not_paired)
+                    },
+                    position = SettingsCardPosition.Bottom,
+                    onClick = {
+                        clickHaptic(view)
+                        showAdbPairingDialog = true
+                    },
+                )
+            }
         }
         item { SectionLabel(stringResource(R.string.about)) }
         item {

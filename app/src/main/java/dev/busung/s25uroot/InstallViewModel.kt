@@ -457,6 +457,169 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         AdbKeyManager(app) // ensure key material exists for root-on-boot
     }
 
+    // ---------------------------------------------------------------------
+    // Module activation through the app's OWN KernelSU su grant — never a
+    // com.android.shell grant, never wireless ADB.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Mounts KernelSU modules and restarts zygote so Zygisk-based modules
+     * (LSPosed, ...) inject into fresh processes. Causes a short soft
+     * reboot: lockscreen reappears; kernel, root and modules persist.
+     */
+    fun applyModules() {
+        runModulePipeline()
+    }
+
+    /** Manual trigger from the start screen: mount + soft-reboot via ksud. */
+    fun softReboot() {
+        runModulePipeline()
+    }
+
+    private fun runModulePipeline() {
+        if (installJob?.isActive == true) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val ownedEntry = activeHistoryEntry == null
+            if (ownedEntry) startHistory() // module runs must leave a trace
+            var succeeded = false
+            try {
+                appendLog(app.getString(R.string.log_modules_applying))
+                succeeded = applyModulesViaSu()
+            } catch (error: Throwable) {
+                appendLog("[-] ${error.message ?: error.javaClass.simpleName}")
+            } finally {
+                if (ownedEntry) {
+                    finishHistory(if (succeeded) InstallRunResult.Succeeded else InstallRunResult.Failed)
+                }
+            }
+        }
+    }
+
+    private data class SuResult(val exitCode: Int, val output: String)
+
+    /**
+     * Runs a command through KernelSU's su as THIS app process. Requires
+     * the Root My Galaxy package to be granted root in KernelSU Manager.
+     *
+     * Exit codes are UNRELIABLE here: `su -c` keeps the stdout pipe open
+     * via its daemon child, so a perfectly successful command often only
+     * ends when the watchdog fires. Callers must therefore judge success
+     * by the returned OUTPUT, never by exitCode. Null = spawn failure only.
+     */
+    private fun runSu(command: String, timeoutMs: Long = SU_TIMEOUT_MS): SuResult? {
+        val started = System.currentTimeMillis()
+        val result = runCatching {
+            val process = ProcessBuilder("/system/bin/su", "-c", command)
+                .redirectErrorStream(true)
+                .start()
+            java.util.concurrent.Executors.newSingleThreadExecutor().use { watchdog ->
+                watchdog.submit {
+                    Thread.sleep(timeoutMs)
+                    process.destroyForcibly()
+                }
+                val output = process.inputStream.bufferedReader().readText()
+                val exitCode = runCatching { process.exitValue() }.getOrDefault(-1)
+                SuResult(exitCode, output)
+            }
+        }.getOrNull()
+        Log.i(
+            APPLY_LOG_TAG,
+            "runSu('${command.take(48)}') -> " +
+                (result?.let { "exit=${it.exitCode} out[${it.output.length}]=${it.output.take(60)}" } ?: "SPAWN-FAILURE"),
+        )
+        return result
+    }
+
+    /**
+     * Full ksud lifecycle + zygote restart using the app-owned su grant.
+     * Returns false when su itself is not usable.
+     */
+    private fun applyModulesViaSu(): Boolean {
+        // First su call may block on KernelSU's interactive grant prompt;
+        // give the user one beat to answer, then bail out.
+        var id = runSu("id", SU_CHECK_TIMEOUT_MS)
+        if (id == null || !id.output.contains("uid=0")) {
+            Thread.sleep(3_000)
+            id = runSu("id", SU_CHECK_TIMEOUT_MS)
+        }
+        if (id == null || !id.output.contains("uid=0")) {
+            appendLog("[!] app-owned su unavailable - grant root to this app in KernelSU Manager and retry")
+            return false
+        }
+        appendLog("[+] app su granted - running ksud lifecycle locally")
+
+        // ONE detached root script chains all three ksud stages and writes
+        // stage markers into the APP's own filesDir, which we then read
+        // locally with zero su calls. Static script text, no shell variables.
+        val applyDir = File(app.filesDir, "apply").apply { mkdirs() }
+        val doneFile = File(applyDir, "done")
+        val progressFile = File(applyDir, "progress")
+        val ksudLogFile = File(applyDir, "ksud.log")
+        doneFile.delete()
+        progressFile.delete()
+        val script = """
+            rm -f %DONE% %PROG%
+            : > %LOG%
+            timeout 60 /data/adb/ksud post-fs-data >> %LOG% 2>&1 </dev/null; echo pfd >> %PROG%
+            timeout 60 /data/adb/ksud services >> %LOG% 2>&1 </dev/null; echo svc >> %PROG%
+            timeout 60 /data/adb/ksud boot-completed >> %LOG% 2>&1 </dev/null; echo bc >> %PROG%
+            sync
+            echo ALL > %DONE%
+            chmod 666 %DONE% %PROG% %LOG% 2>/dev/null
+            """.trimIndent()
+            .replace("%DONE%", doneFile.absolutePath)
+            .replace("%PROG%", progressFile.absolutePath)
+            .replace("%LOG%", ksudLogFile.absolutePath)
+        val fired = runSu("setsid sh -c '$script' &", STAGE_FIRE_TIMEOUT_MS)
+        if (fired == null) {
+            appendLog("[!] ksud lifecycle failed to start")
+            return false
+        }
+
+        // Local poll of the marker files - no su involvement during wait.
+        val startedAt = System.currentTimeMillis()
+        while (System.currentTimeMillis() - startedAt < MODULE_WAIT_MILLIS) {
+            if (doneFile.exists() && doneFile.readText().contains("ALL")) break
+            Thread.sleep(500)
+        }
+        if (!doneFile.exists()) {
+            appendLog("[!] ksud lifecycle timed out (see apply/ksud.log in app data)")
+            return false
+        }
+        val stages = if (progressFile.exists()) progressFile.readText().trim().replace("\n", " → ") else "unknown"
+        appendLog("[*] ksud lifecycle done in ${(System.currentTimeMillis() - startedAt) / 1000}s [$stages]")
+
+        // While we hold root: whitelist this app's ADB key for every adbd
+        // transport and switch adbd to stable TCP 5555. From then on the
+        // app reaches adbd without wireless debugging, mDNS or rotating
+        // ports. Restarting adbd drops any live wireless session, so this
+        // runs over the su channel and is the LAST step before the kill.
+        val keyLine = AdbKeyManager(app).adbKeyFileLine()
+        val harden = runSu(
+            "mkdir -p /data/misc/adb; touch /data/misc/adb/adb_keys; " +
+                "grep -qF '$keyLine' /data/misc/adb/adb_keys 2>/dev/null || echo '$keyLine' >> /data/misc/adb/adb_keys; " +
+                "setprop service.adb.tcp.port 5555; " +
+                "(stop adbd; start adbd) >/dev/null 2>&1; " +
+                "sleep 1; getprop service.adb.tcp.port",
+            SU_CHECK_TIMEOUT_MS,
+        )
+        if (harden != null && harden.output.trim().endsWith("5555")) {
+            appendLog("[+] stable adbTCP enabled - adbd on port 5555, key whitelisted")
+        } else {
+            appendLog("[!] stable adbTCP setup failed${harden?.let { ": getprop=${it.output.trim().takeLast(40)}" } ?: " (timeout)"}")
+        }
+
+        // Restart zygote so Zygisk modules inject. The kill takes the
+        // framework (and this app) down with it: fire detached, report now.
+        runSu(
+            "setsid sh -c 'for p in \$(pidof zygote64) \$(pidof zygote); do kill -9 \$p 2>/dev/null; done' &",
+            STAGE_FIRE_TIMEOUT_MS,
+        )
+        appendLog(app.getString(R.string.log_modules_zygote_restarted))
+        return true
+    }
+
+
     private fun detectInstalled(): Boolean {
         if (NativeProbe.isKernelSuActive()) return true
         val bootToken = currentBootToken() ?: return false
@@ -658,6 +821,11 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         private const val SHIZUKU_LOG_PATH = "/data/local/tmp/ksu-exploit.log"
         private const val TRANSPORT_STABLE_5555 = "[*] transport: stable adbTCP 127.0.0.1:5555"
         private const val TRANSPORT_WIRELESS_DEBUGGING = "[*] transport: wireless debugging (dynamic port)"
+        private const val SU_TIMEOUT_MS = 90_000L
+        private const val SU_CHECK_TIMEOUT_MS = 20_000L
+        private const val STAGE_FIRE_TIMEOUT_MS = 10_000L
+        private const val MODULE_WAIT_MILLIS = 90_000L
+        private const val APPLY_LOG_TAG = "RmgApply"
         private const val SHIZUKU_HELPER_PATH = "/data/local/tmp/ksu-helper"
         private const val SHIZUKU_PAYLOAD_PATH = "/data/local/tmp/ksu-payload"
         private const val SHIZUKU_KSUD_PATH = "/data/local/tmp/ksud-s25u-kdp"

@@ -47,22 +47,31 @@ class RootOnBootService : Service() {
         // late-loads or zygote kills destabilize the device (observed
         // soft-reboot loops).
         if (!RUNNING.compareAndSet(false, true)) {
-            stopSelf()
+            // A retry alarm fired while this SAME service instance is
+            // already running the pipeline. Calling stopSelf() here would
+            // strip foreground protection from the active exploit (Android
+            // delivers every start to one instance). The running pipeline
+            // stops the service itself when it finishes.
             return START_NOT_STICKY
         }
         scope.launch {
-            val result = runCatching { runRootOnBoot() }
-            val message = result.fold(
-                onSuccess = { getString(R.string.boot_notification_success) },
-                onFailure = {
-                    getString(R.string.boot_notification_failed, it.message ?: it.javaClass.simpleName)
-                },
-            )
-            RootOnBootProgress.update(RootOnBootState.Done(result.isSuccess, message))
-            notifyResult(result.isSuccess, message)
-            RUNNING.set(false)
-            stopForeground(STOP_FOREGROUND_DETACH)
-            stopSelf()
+            try {
+                val result = runCatching { runRootOnBoot() }
+                val message = result.fold(
+                    onSuccess = { getString(R.string.boot_notification_success) },
+                    onFailure = {
+                        getString(R.string.boot_notification_failed, it.message ?: it.javaClass.simpleName)
+                    },
+                )
+                RootOnBootProgress.update(RootOnBootState.Done(result.isSuccess, message))
+                notifyResult(result.isSuccess, message)
+            } finally {
+                // Guaranteed cleanup: the guard flag and the foreground
+                // state must reset even if the coroutine is cancelled.
+                RUNNING.set(false)
+                stopForeground(STOP_FOREGROUND_DETACH)
+                stopSelf()
+            }
         }
         return START_NOT_STICKY
     }
@@ -113,6 +122,9 @@ class RootOnBootService : Service() {
 
         // 1-3. Enable wireless debugging, discover port, connect (shared session).
         val adb = WirelessAdbSession.open(this)
+        // Every exit path — success, failure, or the reboot-retry return —
+        // must release the socket and its reader thread.
+        try {
 
         // Wake the display: with the screen off the SoC can enter suspend
         // between timing-critical exploit steps even under a partial
@@ -223,7 +235,18 @@ class RootOnBootService : Service() {
                     getString(R.string.boot_stage_exploit),
                     "failed - rebooting to retry ($attempts/$MAX_BOOT_RETRIES)",
                 )
-                runCatching { adb.shell("sync; sleep 2; reboot") }
+                // A dropped transport right after the command was sent is
+                // EXPECTED (adbd dies mid-reboot) and means the request
+                // went through. Any other failure must surface as failure
+                // instead of a bogus success notification.
+                val reboot = runCatching { adb.shell("sync; sleep 2; reboot") }
+                val requested = reboot.getOrNull()?.let { it.exitCode == 0 } == true ||
+                    reboot.exceptionOrNull() is java.io.IOException
+                check(requested) {
+                    "Exploit failed and the reboot request failed " +
+                        "(${reboot.exceptionOrNull()?.message ?: "exit=${reboot.getOrNull()?.exitCode}"}) " +
+                        "- not rebooting into an unbounded retry"
+                }
                 Thread.sleep(20_000) // let adbd drop as the device reboots
                 adb.close()
                 return
@@ -259,24 +282,18 @@ class RootOnBootService : Service() {
                 applied = true
                 break
             }
-            // Secondary signal: KernelSU live this boot means the exploit +
-            // late-load succeeded even if the done-marker was lost (e.g. an
-            // apply actor died before recording completion). Accept it after
-            // a grace period instead of reporting a false failure.
-            if (System.currentTimeMillis() - started > KSU_ACTIVE_GRACE_MS &&
-                NativeProbe.isKernelSuActive()
-            ) {
-                applied = true
-                break
-            }
-            Thread.sleep(10_000)
         }
         // Root is up and modules applied: leave adbd on stable TCP 5555 so
         // later sessions skip wireless debugging entirely. Last adb op —
         // the restart drops this session, which is fine now.
         runCatching { adb.switchToTcp5555() }
-        adb.close()
+        // Only the native done-marker proves module activation. KernelSU
+        // being merely loaded says nothing about post-fs-data/services/
+        // boot-completed — accepting it as success would report a lie.
         check(applied) { "Module activation did not complete within ${MODULE_WAIT_MS / 1000}s" }
+        } finally {
+            runCatching { adb.close() }
+        }
     }
 
     private fun startInForeground() {
@@ -352,7 +369,6 @@ class RootOnBootService : Service() {
         private const val LEGACY_KSUD_NAME = "ksud-s25u-kdp"
         /** Wait this long for a fresh done-marker before trusting the
          * KernelSU-active probe as a success fallback. */
-        private const val KSU_ACTIVE_GRACE_MS = 120_000L
         /** Upper bound for one full pipeline (connect + staging + exploit +
          * late-load + module wait). */
         private const val PIPELINE_WAKELOCK_MS = 20 * 60_000L

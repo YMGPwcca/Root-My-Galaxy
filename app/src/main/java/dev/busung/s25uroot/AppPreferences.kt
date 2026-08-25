@@ -109,9 +109,12 @@ object AppPreferences {
         prefs(context).getInt(BOOT_RETRY_COUNT, 0)
 
     fun setBootRetryCount(context: Context, count: Int) {
+        // SYNCHRONOUS: this counter's entire purpose is bounding the
+        // reboot-retry loop. An async write can be lost by the very reboot
+        // it is supposed to gate, unbounding the loop.
         prefs(context).edit()
             .putInt(BOOT_RETRY_COUNT, count)
-            .apply()
+            .commit()
     }
 
     @Synchronized

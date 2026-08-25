@@ -193,7 +193,8 @@
 <string name="action_restart_zygisk">Restart Zygisk</string>
 <string name="soft_reboot_desc">Mount KSU modules via ksud and restart zygote so Zygisk/LSPosed modules inject (root)</string>
 <string name="first_install_shell_root_hint">For module activation (Zygisk/LSPosed) to work automatically, grant root access to the shell app in KernelSU Manager after the first install. This grant persists across reboots.</string>
-<string name="section_root_on_boot">Root on boot</string>
+<string name="section_automation">Automation</string>
+    <string name="section_bootstrap_transport">Bootstrap transport</string>
 <string name="boot_stage_connecting">Connecting wireless ADB</string>
 <string name="boot_stage_staging">Staging payloads</string>
 <string name="boot_stage_exploit">Running exploit</string>

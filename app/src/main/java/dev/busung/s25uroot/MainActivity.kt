@@ -1626,10 +1626,43 @@ private fun SettingsPage(
                     title = stringResource(R.string.language),
                     description = stringResource(R.string.language_description),
                     value = languageLabel(currentLanguageTag),
-                    position = SettingsCardPosition.Middle,
+                    position = SettingsCardPosition.Bottom,
                     onClick = {
                         clickHaptic(view)
                         showLanguageDialog = true
+                    },
+                )
+            }
+        }
+        item { SectionLabel(stringResource(R.string.advanced)) }
+        item {
+            SettingsSwitchCard(
+                icon = Icons.Rounded.Memory,
+                title = stringResource(R.string.advanced_mode),
+                description = stringResource(R.string.advanced_mode_description),
+                checked = advancedMode,
+                onCheckedChange = {
+                    clickHaptic(view)
+                    onAdvancedModeChanged(it)
+                },
+            )
+        }
+        item { SectionLabel(stringResource(R.string.section_bootstrap_transport)) }
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                SettingsCard(
+                    icon = Icons.Rounded.Wifi,
+                    title = stringResource(R.string.pref_adb_pairing),
+                    description = stringResource(R.string.pref_adb_pairing_summary),
+                    value = if (adbPaired) {
+                        stringResource(R.string.adb_pair_status_paired)
+                    } else {
+                        stringResource(R.string.adb_pair_status_not_paired)
+                    },
+                    position = SettingsCardPosition.Top,
+                    onClick = {
+                        clickHaptic(view)
+                        showAdbPairingDialog = true
                     },
                 )
                 SettingsSwitchCard(
@@ -1659,20 +1692,7 @@ private fun SettingsPage(
                 )
             }
         }
-        item { SectionLabel(stringResource(R.string.advanced)) }
-        item {
-            SettingsSwitchCard(
-                icon = Icons.Rounded.Memory,
-                title = stringResource(R.string.advanced_mode),
-                description = stringResource(R.string.advanced_mode_description),
-                checked = advancedMode,
-                onCheckedChange = {
-                    clickHaptic(view)
-                    onAdvancedModeChanged(it)
-                },
-            )
-        }
-        item { SectionLabel(stringResource(R.string.section_root_on_boot)) }
+        item { SectionLabel(stringResource(R.string.section_automation)) }
         item {
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 SettingsSwitchCard(
@@ -1692,26 +1712,11 @@ private fun SettingsPage(
                     title = stringResource(R.string.pref_auto_root_boot),
                     description = stringResource(R.string.pref_auto_root_boot_summary),
                     checked = autoRootOnBoot,
-                    position = SettingsCardPosition.Middle,
+                    position = SettingsCardPosition.Bottom,
                     onCheckedChange = { enabled ->
                         clickHaptic(view)
                         autoRootOnBoot = enabled
                         AppPreferences.setAutoRootOnBoot(context, enabled)
-                    },
-                )
-                SettingsCard(
-                    icon = Icons.Rounded.Wifi,
-                    title = stringResource(R.string.pref_adb_pairing),
-                    description = stringResource(R.string.pref_adb_pairing_summary),
-                    value = if (adbPaired) {
-                        stringResource(R.string.adb_pair_status_paired)
-                    } else {
-                        stringResource(R.string.adb_pair_status_not_paired)
-                    },
-                    position = SettingsCardPosition.Bottom,
-                    onClick = {
-                        clickHaptic(view)
-                        showAdbPairingDialog = true
                     },
                 )
             }

@@ -89,7 +89,6 @@ class Spake2(private val password: ByteArray) {
         negWN[31] = (negWN[31].toInt() xor 0x80).toByte() // negate point
         val sMinusWN = ed25519PointAdd(theirMsg, negWN)
         val k = ed25519ScalarMult(x, sMinusWN)
-        Log.d(TAG, "K=${k.toHex().take(16)}...")
 
         // transcript = SHA512( len||clientName || len||serverName || len||T || len||S
         //                      || len||K || len||password_hash )
@@ -101,11 +100,11 @@ class Spake2(private val password: ByteArray) {
         md.updateLenPrefixed(k)
         md.updateLenPrefixed(passwordHash)
         val keyMaterial = md.digest()
-        Log.d(TAG, "key_material=${keyMaterial.toHex().take(16)}...")
+        // No logging past this point: K, key_material and the derived AES
+        // key are secrets. They must never reach logcat.
 
         // aesKey = HKDF-SHA256(key_material, salt=zeros32, info, 16)
         aesKey = hkdfSha256(keyMaterial, "adb pairing_auth aes-128-gcm key".toByteArray(), 16)
-        Log.d(TAG, "aesKey=${aesKey!!.toHex()}")
         return true
     }
 

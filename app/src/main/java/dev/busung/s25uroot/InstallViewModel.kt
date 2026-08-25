@@ -502,9 +502,10 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
      * the Root My Galaxy package to be granted root in KernelSU Manager.
      *
      * Exit codes are UNRELIABLE here: `su -c` keeps the stdout pipe open
-     * via its daemon child, so a perfectly successful command often only
-     * ends when the watchdog fires. Callers must therefore judge success
-     * by the returned OUTPUT, never by exitCode. Null = spawn failure only.
+     * via its daemon child, so a command whose work is done may still not
+     * see EOF until the watchdog fires. Callers must therefore judge
+     * success by the returned OUTPUT, never by exitCode.
+     * Null = spawn failure only.
      */
     private fun runSu(command: String, timeoutMs: Long = SU_TIMEOUT_MS): SuResult? {
         val started = System.currentTimeMillis()
@@ -512,15 +513,29 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
             val process = ProcessBuilder("/system/bin/su", "-c", command)
                 .redirectErrorStream(true)
                 .start()
-            java.util.concurrent.Executors.newSingleThreadExecutor().use { watchdog ->
-                watchdog.submit {
+            // Interruptible daemon watchdog: a finished command returns
+            // IMMEDIATELY (the interrupt cancels the pending destroy),
+            // while a hung command is still killed at [timeoutMs]. An
+            // executor-based watchdog cannot do both — its shutdown waits
+            // out the whole sleep, stalling every call for the full
+            // timeout even when the command finished instantly.
+            val watchdog = Thread {
+                try {
                     Thread.sleep(timeoutMs)
-                    process.destroyForcibly()
+                } catch (_: InterruptedException) {
+                    return@Thread
                 }
-                val output = process.inputStream.bufferedReader().readText()
-                val exitCode = runCatching { process.exitValue() }.getOrDefault(-1)
-                SuResult(exitCode, output)
+                process.destroyForcibly()
             }
+            watchdog.isDaemon = true
+            watchdog.start()
+            val output = try {
+                process.inputStream.bufferedReader().readText()
+            } finally {
+                watchdog.interrupt()
+            }
+            val exitCode = runCatching { process.exitValue() }.getOrDefault(-1)
+            SuResult(exitCode, output)
         }.getOrNull()
         Log.i(
             APPLY_LOG_TAG,
@@ -550,7 +565,10 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
         // ONE detached root script chains all three ksud stages and writes
         // stage markers into the APP's own filesDir, which we then read
-        // locally with zero su calls. Static script text, no shell variables.
+        // locally with zero su calls. Static script text, no shell
+        // variables interpolated from Kotlin ($r/$s/$t are shell state).
+        // Each stage's exit code gates the final marker: a timed-out or
+        // failed stage writes FAIL, never ALL.
         val applyDir = File(app.filesDir, "apply").apply { mkdirs() }
         val doneFile = File(applyDir, "done")
         val progressFile = File(applyDir, "progress")
@@ -560,16 +578,31 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         val script = """
             rm -f %DONE% %PROG%
             : > %LOG%
-            timeout 60 /data/adb/ksud post-fs-data >> %LOG% 2>&1 </dev/null; echo pfd >> %PROG%
-            timeout 60 /data/adb/ksud services >> %LOG% 2>&1 </dev/null; echo svc >> %PROG%
-            timeout 60 /data/adb/ksud boot-completed >> %LOG% 2>&1 </dev/null; echo bc >> %PROG%
+            r=0
+            timeout 60 /data/adb/ksud post-fs-data >> %LOG% 2>&1 </dev/null || r=1
+            echo "pfd:%R%" >> %PROG%
+            s=0
+            timeout 60 /data/adb/ksud services >> %LOG% 2>&1 </dev/null || s=1
+            echo "svc:%S%" >> %PROG%
+            t=0
+            timeout 60 /data/adb/ksud boot-completed >> %LOG% 2>&1 </dev/null || t=1
+            echo "bc:%T%" >> %PROG%
             sync
-            echo ALL > %DONE%
+            if [ "%R%%S%%T%" = "000" ]; then
+              echo ALL > %DONE%
+            else
+              echo FAIL > %DONE%
+            fi
             chmod 666 %DONE% %PROG% %LOG% 2>/dev/null
             """.trimIndent()
             .replace("%DONE%", doneFile.absolutePath)
             .replace("%PROG%", progressFile.absolutePath)
             .replace("%LOG%", ksudLogFile.absolutePath)
+            // Shell variables arrive via placeholders: Kotlin raw strings
+            // cannot contain a literal $ without ${'$'} gymnastics.
+            .replace("%R%", "\$r")
+            .replace("%S%", "\$s")
+            .replace("%T%", "\$t")
         val fired = runSu("setsid sh -c '$script' &", STAGE_FIRE_TIMEOUT_MS)
         if (fired == null) {
             appendLog("[!] ksud lifecycle failed to start")
@@ -584,6 +617,11 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         }
         if (!doneFile.exists()) {
             appendLog("[!] ksud lifecycle timed out (see apply/ksud.log in app data)")
+            return false
+        }
+        if (doneFile.readText().contains("FAIL")) {
+            val stages = if (progressFile.exists()) progressFile.readText().trim().replace("\n", " ") else "unknown"
+            appendLog("[!] ksud stage failed [\$stages] - see apply/ksud.log in app data")
             return false
         }
         val stages = if (progressFile.exists()) progressFile.readText().trim().replace("\n", " → ") else "unknown"

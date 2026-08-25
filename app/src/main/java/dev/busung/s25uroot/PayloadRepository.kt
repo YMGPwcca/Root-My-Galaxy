@@ -91,7 +91,7 @@ class PayloadRepository(private val context: Context) {
     private fun fetchRemoteTargets(): List<TargetProfile> {
         val commit = resolveMainCommit()
         val manifestBytes = downloadBytes(rawUrl(commit, MANIFEST_PATH), MAX_MANIFEST_BYTES)
-        cacheManifest(manifestBytes)
+        cacheManifest(manifestBytes, commit)
         return SupportManifest.parse(manifestBytes).targets.map { profile ->
             profile.copy(
                 exploit = pinArtifact(profile.exploit, commit),
@@ -109,14 +109,35 @@ class PayloadRepository(private val context: Context) {
         return artifact.copy(source = source)
     }
 
-    private fun cacheManifest(bytes: ByteArray) {
-        runCatching { manifestCacheFile.writeBytes(bytes) }
+    private fun cacheManifest(bytes: ByteArray, commit: String) {
+        runCatching {
+            manifestCacheFile.writeBytes(bytes)
+            File(context.filesDir, CACHE_COMMIT_FILE).writeText(commit, Charsets.US_ASCII)
+        }
     }
 
+    /**
+     * Restores the last-good network manifest. The commit stored alongside
+     * it re-pins every artifact URL and restores sourceRevision, so the
+     * offline path keeps the same integrity properties as the live path
+     * instead of silently degrading to mutable main-branch URLs.
+     */
     private fun loadTargetsFromCache(): List<TargetProfile>? = runCatching {
         val file = manifestCacheFile
         if (!file.isFile) return null
-        SupportManifest.parse(file.readBytes()).targets
+        val profiles = SupportManifest.parse(file.readBytes()).targets
+        val commit = File(context.filesDir, CACHE_COMMIT_FILE)
+            .takeIf { it.isFile }
+            ?.readText(Charsets.US_ASCII)
+            ?.trim()
+        if (commit == null || !commit.matches(Regex("[0-9a-f]{40}"))) return profiles
+        profiles.map { profile ->
+            profile.copy(
+                exploit = pinArtifact(profile.exploit, commit),
+                kernelSu = pinArtifact(profile.kernelSu, commit),
+                sourceRevision = commit,
+            )
+        }
     }.getOrNull()
 
     private val manifestCacheFile: File
@@ -336,6 +357,7 @@ class PayloadRepository(private val context: Context) {
         private const val EXPLOIT_FILE_NAME = "cve-2026-43499-app.so"
         private const val KSUD_FILE_NAME = "ksud-s25u-kdp"
         private const val REVISION_MARKER = ".source-revision"
+        private const val CACHE_COMMIT_FILE = "cached-targets-v3.commit"
         private const val COMMIT_API_URL =
             "https://api.github.com/repos/BuSung-dev/Root-My-Galaxy-Payloads/git/ref/heads/main"
         private const val RAW_REPOSITORY =

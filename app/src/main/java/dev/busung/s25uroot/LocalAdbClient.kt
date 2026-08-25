@@ -156,9 +156,16 @@ class LocalAdbClient(
      * dropped — identity routing, not timing.
      */
     private fun nextMessageFor(localId: Int, timeoutMs: Long = 0): AdbMessage {
+        var dropped = 0
         while (true) {
             val msg = nextMessage(timeoutMs)
             if (msg.arg1 == localId) return msg
+            dropped++
+            // A sane session leaves at most a handful of residue frames.
+            // Escalate loudly instead of dropping forever if a transport
+            // misbehaves and floods frames for streams that never existed.
+            if (dropped == 50) Log.w(TAG, "50 stale messages dropped for stream $localId - transport misbehaving?")
+            check(dropped < 500) { "500 stale ADB messages dropped for stream $localId - transport is broken" }
             Log.d(TAG, "dropping stale message for stream ${msg.arg1} (want $localId)")
         }
     }
@@ -219,11 +226,17 @@ class LocalAdbClient(
             write(A_OPEN, localId, 0, "tcpip:$port")
             val message = nextMessageFor(localId)
             message.command == A_OKAY
-        } catch (t: Throwable) {
+        } catch (e: IOException) {
             // adbd tears the stream down mid-handshake when it restarts;
             // that is expected and usually means success.
-            Log.d(TAG, "tcpip: stream ended (${t.javaClass.simpleName})")
+            Log.d(TAG, "tcpip: stream ended (${e.javaClass.simpleName})")
             true
+        } catch (t: Throwable) {
+            // Anything else is a real protocol/transport error: reporting
+            // success here would make the caller wait for a 5555 listener
+            // that will never come up.
+            Log.w(TAG, "tcpip: unexpected error (${t.javaClass.simpleName}: ${t.message})")
+            false
         }
     }
     /**

@@ -64,11 +64,19 @@
             android:name=".RootOnBootService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="specialUse" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Re-runs the kernel-exploit pipeline after boot to restore root without a PC" />
+        </service>
         <service
             android:name=".AdbPairingService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="specialUse" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Wireless-debugging SPAKE2 pairing exchange can outlive backgrounded processes" />
+        </service>
     </application>
 </manifest>

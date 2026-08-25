@@ -3,8 +3,18 @@ package dev.busung.s25uroot
 import org.json.JSONArray
 import org.json.JSONObject
 
+/**
+ * Where a single payload binary comes from. A remote artifact is fetched
+ * over HTTP and pinned to the payload repository commit it was resolved
+ * against; a bundled artifact is extracted from the APK's own assets.
+ */
+sealed class ArtifactSource {
+    data class Remote(val url: String) : ArtifactSource()
+    data class Bundled(val assetPath: String) : ArtifactSource()
+}
+
 data class RemoteArtifact(
-    val url: String,
+    val source: ArtifactSource,
     val size: Long,
 )
 
@@ -15,14 +25,34 @@ data class TargetProfile(
     val kernelVersions: Set<String>,
     val exploit: RemoteArtifact,
     val kernelSu: RemoteArtifact,
+    /**
+     * Kernel address-leak strategy used by the exploit build. Profiles
+     * leaking through tracefs need a shell-uid context (wireless ADB);
+     * profiles without a slide source run directly from the app process.
+     */
+    val slideSource: String? = null,
+    /** True when set: bundled entries win manifest merges over remote ones. */
+    val bundled: Boolean = false,
+    /**
+     * Identifies the exact origin of this profile's binaries (payload repo
+     * commit for network profiles, APK build for bundled ones). Staged
+     * payloads are invalidated whenever it changes, so a same-size rebuild
+     * can never keep running in place of the current release.
+     */
+    val sourceRevision: String? = null,
 ) {
     init {
         require(models.isNotEmpty()) { "Payload must support at least one model" }
         require(kernelVersions.isNotEmpty()) { "Payload must support at least one kernel version" }
     }
 
+    /** Exploit needs a shell context (wireless ADB bootstrap) to leak. */
+    val requiresShellContext: Boolean
+        get() = slideSource.equals("tracefs", ignoreCase = true)
+
     fun matchesDevice(snapshot: DeviceSnapshot): Boolean =
         models.any { it.equals(snapshot.model, ignoreCase = true) }
+
 
     fun matchesKernelVersion(snapshot: DeviceSnapshot): Boolean =
         snapshot.kernelVersion in kernelVersions
@@ -50,27 +80,34 @@ data class SupportManifest(
             val payloads = buildList {
                 for (index in 0 until payloadsJson.length()) {
                     val payload = payloadsJson.getJSONObject(index)
-                    val exploit = payload.getJSONObject("exploit")
-                    val kernelSu = payload.getJSONObject("kernelsu")
                     add(
                         TargetProfile(
                             profileId = payload.getString("payloadId"),
                             displayName = payload.getString("displayName"),
                             models = payload.getJSONArray("models").strings(),
                             kernelVersions = payload.getJSONArray("kernelVersions").strings(),
-                            exploit = RemoteArtifact(
-                                url = exploit.getString("url"),
-                                size = exploit.getLong("size"),
-                            ),
-                            kernelSu = RemoteArtifact(
-                                url = kernelSu.getString("url"),
-                                size = kernelSu.getLong("size"),
-                            ),
+                            exploit = parseArtifact(payload.getJSONObject("exploit")),
+                            kernelSu = parseArtifact(payload.getJSONObject("kernelsu")),
+                            slideSource = payload.optString("slideSource").takeIf { it.isNotEmpty() },
                         ),
                     )
                 }
             }
             return SupportManifest(schemaVersion, payloads)
+        }
+
+        private fun parseArtifact(artifact: JSONObject): RemoteArtifact {
+            val size = artifact.getLong("size")
+            return when {
+                artifact.has("asset") -> RemoteArtifact(
+                    source = ArtifactSource.Bundled(artifact.getString("asset")),
+                    size = size,
+                )
+                else -> RemoteArtifact(
+                    source = ArtifactSource.Remote(artifact.getString("url")),
+                    size = size,
+                )
+            }
         }
 
         private fun JSONArray.strings(): Set<String> = buildSet {

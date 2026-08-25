@@ -69,7 +69,12 @@ data class TargetProfile(
      * never run on a different build just because model and kernel match.
      */
     fun matchesFirmware(snapshot: DeviceSnapshot): Boolean =
-        firmwares.isEmpty() || firmwares.any { snapshot.fingerprint.contains(it, ignoreCase = true) }
+        firmwares.isEmpty() || firmwares.any { wanted ->
+            // Segment-bounded: the firmware tag is one /-delimited
+            // fingerprint segment. Substring matching would let a short or
+            // generic tag (e.g. "S911B") match ANY build of the model.
+            snapshot.fingerprint.split('/').any { it.equals(wanted, ignoreCase = true) }
+        }
 
     fun matches(snapshot: DeviceSnapshot): Boolean =
         matchesDevice(snapshot) && matchesKernelVersion(snapshot) && matchesFirmware(snapshot)

@@ -67,6 +67,8 @@ object AppUpdater {
         if (latestVersion.isEmpty() || latestVersion == currentVersion) return false
         // Numeric-aware: an OLDER or differently-suffixed version must not
         // be offered as an update ("0.2.64" < "0.2.65-rmg-dm1q").
+        // Suffix-blind by design: "0.2.65-rmg-dm1q" compares as [0, 2, 65].
+        // Pre-release-style suffix increments alone never offer an update.
         fun numericParts(version: String) = version.removePrefix("v")
             .split('.', '-')
             .mapNotNull { it.toIntOrNull() }

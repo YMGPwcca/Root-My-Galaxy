@@ -31,6 +31,13 @@ data class TargetProfile(
      * profiles without a slide source run directly from the app process.
      */
     val slideSource: String? = null,
+    /**
+     * Firmware build tags the payload is validated against (e.g.
+     * "S911BXXU9FZDP"), matched against the device fingerprint. Empty set
+     * = no firmware constraint, which keeps upstream profiles (that do
+     * not ship the field) matching exactly as before.
+     */
+    val firmwares: Set<String> = emptySet(),
     /** True when set: bundled entries win manifest merges over remote ones. */
     val bundled: Boolean = false,
     /**
@@ -57,8 +64,15 @@ data class TargetProfile(
     fun matchesKernelVersion(snapshot: DeviceSnapshot): Boolean =
         snapshot.kernelVersion in kernelVersions
 
+    /**
+     * Firmware-specific payloads (kernel offsets baked for one build) must
+     * never run on a different build just because model and kernel match.
+     */
+    fun matchesFirmware(snapshot: DeviceSnapshot): Boolean =
+        firmwares.isEmpty() || firmwares.any { snapshot.fingerprint.contains(it, ignoreCase = true) }
+
     fun matches(snapshot: DeviceSnapshot): Boolean =
-        matchesDevice(snapshot) && matchesKernelVersion(snapshot)
+        matchesDevice(snapshot) && matchesKernelVersion(snapshot) && matchesFirmware(snapshot)
 
     val supportedModels: String
         get() = models.joinToString()
@@ -88,6 +102,7 @@ data class SupportManifest(
                             kernelVersions = payload.getJSONArray("kernelVersions").strings(),
                             exploit = parseArtifact(payload.getJSONObject("exploit")),
                             kernelSu = parseArtifact(payload.getJSONObject("kernelsu")),
+                            firmwares = payload.optJSONArray("firmwares")?.strings() ?: emptySet(),
                             slideSource = payload.optString("slideSource").takeIf { it.isNotEmpty() }.also {
                                 // Fail closed: an unknown slide source must
                                 // reject the profile instead of silently

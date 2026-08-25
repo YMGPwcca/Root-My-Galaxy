@@ -63,8 +63,22 @@ object AppUpdater {
         }
     }
 
-    fun isUpdateAvailable(latestVersion: String, currentVersion: String): Boolean =
-        latestVersion.isNotEmpty() && latestVersion != currentVersion
+    fun isUpdateAvailable(latestVersion: String, currentVersion: String): Boolean {
+        if (latestVersion.isEmpty() || latestVersion == currentVersion) return false
+        // Numeric-aware: an OLDER or differently-suffixed version must not
+        // be offered as an update ("0.2.64" < "0.2.65-rmg-dm1q").
+        fun numericParts(version: String) = version.removePrefix("v")
+            .split('.', '-')
+            .mapNotNull { it.toIntOrNull() }
+        val latest = numericParts(latestVersion)
+        val current = numericParts(currentVersion)
+        for (index in 0 until maxOf(latest.size, current.size)) {
+            val a = latest.getOrElse(index) { 0 }
+            val b = current.getOrElse(index) { 0 }
+            if (a != b) return a > b
+        }
+        return false
+    }
 
     suspend fun downloadApk(
         context: Context,

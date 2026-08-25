@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 3,
+  "payloads": [
+    {
+      "payloadId": "dm1q-S911BXXU9FZDP-proven",
+      "displayName": "Galaxy S23 (dm1q) FZDP | proven build",
+      "models": ["SM-S911B"],
+      "kernelVersions": ["5.15.189"],
+      "slideSource": "tracefs",
+      "exploit": {
+        "asset": "artifacts/dm1q-S911BXXU9FZDP-proven/cve-2026-43499-app.so",
+        "size": 130528
+      },
+      "kernelsu": {
+        "asset": "artifacts/dm1q-S911BXXU9FZDP-proven/ksud-s25u-kdp",
+        "size": 4879560
+      }
+    },
+    {
+      "payloadId": "dm1q-S911BXXU9FZDP-apkbuild",
+      "displayName": "Galaxy S23 (dm1q) FZDP | APK build",
+      "models": ["SM-S911B"],
+      "kernelVersions": ["5.15.189"],
+      "slideSource": "tracefs",
+      "exploit": {
+        "asset": "artifacts/dm1q-S911BXXU9FZDP-apkbuild/cve-2026-43499-app.so",
+        "size": 130608
+      },
+      "kernelsu": {
+        "asset": "artifacts/dm1q-S911BXXU9FZDP-apkbuild/ksud-s25u-kdp",
+        "size": 4879560
+      }
+    }
+  ]
+}

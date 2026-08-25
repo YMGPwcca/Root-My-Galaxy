@@ -1,0 +1,363 @@
+package dev.busung.s25uroot
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
+import android.os.IBinder
+import android.os.PowerManager
+import androidx.core.app.NotificationCompat
+import java.io.File
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+
+/**
+ * Foreground service that re-applies root + KernelSU after boot using the
+ * device's own wireless ADB daemon. No PC required.
+ *
+ * Flow:
+ * 1. Enable wireless debugging (WRITE_SECURE_SETTINGS).
+ * 2. Wait for adbd to listen on TCP.
+ * 3. Connect to 127.0.0.1:5555 with the pre-registered ADB key.
+ * 4. Stage payload + root helper + ksud into /data/local/tmp.
+ * 5. Run the exploit (one attempt per boot).
+ * 6. Load KernelSU, mount modules, restart zygote.
+ * 7. Report the result via notification.
+ */
+class RootOnBootService : Service() {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Foreground contract first: a duplicate start while the pipeline is
+        // already running must still enter the foreground before returning,
+        // otherwise the system raises ForegroundServiceDidNotStartInTime and
+        // crashes the app in a loop (observed on alarm retries).
+        startInForeground()
+        // Single-instance guard: BOOT_COMPLETED plus the alarm retries must
+        // never run two pipelines concurrently - overlapping exploits,
+        // late-loads or zygote kills destabilize the device (observed
+        // soft-reboot loops).
+        if (!RUNNING.compareAndSet(false, true)) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        scope.launch {
+            val result = runCatching { runRootOnBoot() }
+            val message = result.fold(
+                onSuccess = { getString(R.string.boot_notification_success) },
+                onFailure = {
+                    getString(R.string.boot_notification_failed, it.message ?: it.javaClass.simpleName)
+                },
+            )
+            RootOnBootProgress.update(RootOnBootState.Done(result.isSuccess, message))
+            notifyResult(result.isSuccess, message)
+            RUNNING.set(false)
+            stopForeground(STOP_FOREGROUND_DETACH)
+            stopSelf()
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun runRootOnBoot() {
+        // The exploit choreography is timing-sensitive: a suspended SoC
+        // (screen off -> deep idle) desynchronizes it and burns attempts.
+        // Hold a partial wakelock for the whole pipeline and light the
+        // screen once ADB is up.
+        val powerManager = getSystemService(PowerManager::class.java)
+        // Full wakelock with CAUSES_WAKEUP: light the display ourselves so a
+        // boot-time run never starts against a suspended SoC. Partial alone
+        // is not enough on Samsung idle governors (see screen-off failures).
+        val wakeLock = powerManager?.newWakeLock(
+            PowerManager.FULL_WAKE_LOCK or
+                PowerManager.ACQUIRE_CAUSES_WAKEUP,
+            "rmg:RootOnBoot",
+        )
+        wakeLock?.acquire(PIPELINE_WAKELOCK_MS)
+        try {
+            runRootOnBootLocked()
+        } finally {
+            runCatching { if (wakeLock?.isHeld == true) wakeLock.release() }
+        }
+    }
+
+    private fun runRootOnBootLocked() {
+        if (NativeProbe.isKernelSuActive()) {
+            // Already rooted this boot (manual run or earlier retry): keep
+            // the alarm retries harmless and report success immediately.
+            AppPreferences.setBootRetryCount(this, 0)
+            return
+        }
+        val started = System.currentTimeMillis()
+        fun running(stage: String, lastLine: String = "", etaMs: Long = -1) {
+            RootOnBootProgress.update(
+                RootOnBootState.Running(
+                    stage = stage,
+                    lastLine = lastLine,
+                    elapsedMs = System.currentTimeMillis() - started,
+                    etaMs = etaMs,
+                ),
+            )
+            updateNotification("$stage${if (lastLine.isNotBlank()) " — $lastLine" else ""}")
+        }
+
+        running(getString(R.string.boot_stage_connecting))
+
+        // 1-3. Enable wireless debugging, discover port, connect (shared session).
+        val adb = WirelessAdbSession.open(this)
+
+        // Wake the display: with the screen off the SoC can enter suspend
+        // between timing-critical exploit steps even under a partial
+        // wakelock (vendor idle governors are stricter than AOSP). Screen
+        // on + wakelock keeps the pipeline window stable.
+        runCatching { adb.shell("input keyevent KEYCODE_WAKEUP") }
+
+        // 4. Resolve target and stage payloads
+        running(getString(R.string.boot_stage_staging))
+        val repository = PayloadRepository(this)
+        // Cached fallback keeps the pipeline alive when GitHub times out
+        // right after boot (observed HTTP 504 from api.github.com).
+        val profile = repository.resolveTarget(DeviceSnapshot.current(), allowCached = true)
+        val payloadDir = repository.payloadDirectory(profile)
+        val exploit = File(payloadDir, "cve-2026-43499-app.so")
+        val ksud = File(payloadDir, "ksud-s25u-kdp")
+        // The root helper is a per-profile bundled asset: part of the
+        // proven exploit choreography, not of the network feed.
+        val rootHelper = repository.extractRootHelper(profile)
+            ?: error("Bundled root helper missing for ${profile.profileId}")
+
+        // Refresh-on-boot: resolveTarget() already fetched the live manifest,
+        // so compare the cached artifacts against its expected sizes. A
+        // mismatch means a payload was updated upstream since the last run -
+        // re-download before staging so every boot executes the current
+        // build instead of whatever the cache happens to hold.
+        fun cacheComplete(): Boolean =
+            exploit.length() == profile.exploit.size &&
+                ksud.length() == profile.kernelSu.size
+        if (!cacheComplete()) {
+            running(getString(R.string.boot_stage_staging), "refreshing payloads from feed")
+            val refreshed = runCatching { repository.download(profile) {} }
+            if (refreshed.isFailure && !exploit.exists()) {
+                check(false) {
+                    "Payload refresh failed and no cache exists for ${profile.profileId}: " +
+                        refreshed.exceptionOrNull()?.message
+                }
+            }
+        }
+        check(exploit.exists() && ksud.exists() && rootHelper.exists()) {
+            "Cached payloads missing for ${profile.profileId} — run the exploit once from the app first"
+        }
+
+        val remoteExploit = "/data/local/tmp/f946b.so"
+        val remoteHelper = "/data/local/tmp/cve-2026-43499-root"
+        val remoteKsud = "/data/local/tmp/${ksud.name}"
+        val remoteKsudStage = "/data/local/tmp/.ksud-stage"
+
+        adb.push(exploit, remoteExploit, executable = true)
+        adb.push(rootHelper, remoteHelper, executable = true)
+        adb.push(ksud, remoteKsud, executable = true)
+        adb.push(ksud, remoteKsudStage, executable = true)
+
+        // 5. Run the exploit (one attempt per boot) in a streaming shell that
+        // stays open for the full run — adbd kills a backgrounded process the
+        // moment its shell stream closes, and the helper streams the live log
+        // to stdout via a foreground supervisor.
+        running(getString(R.string.boot_stage_exploit), etaMs = RootOnBootProgress.EXPLOIT_ETA_MS)
+        val exploitCmd = buildString {
+            append("RMG_MANAGER_PACKAGE=${BuildConfig.APPLICATION_ID} ")
+            append("SLIDE_SOURCE=tracefs ")
+            append("EXPLOIT_ATTEMPTS=1 ")
+            append("P0_ATTEMPT_TIMEOUT_SEC=115 ")
+            append("EXPLOIT_ATTEMPT_TIMEOUT_SEC=600 ")
+            append("$remoteHelper --run-payload $remoteExploit $remoteHelper /data/local/tmp/f946b.log")
+        }
+        // Stream the exploit output. Once we see "exploit completed", the
+        // supervisor will auto-trigger late-load + apply-modules (which kills
+        // zygote and drops the ADB connection), so we must NOT wait for the
+        // stream to close — return as soon as the success marker appears.
+        var exploitDone = false
+        val exploitOutput = try {
+            adb.runStreaming(
+                exploitCmd,
+                shouldStop = { exploitDone },
+            ) { accumulated ->
+                val lastLine = accumulated.lineSequence()
+                    .filter { it.isNotBlank() }
+                    .lastOrNull()
+                    ?.takeLast(100)
+                    ?: ""
+                val elapsed = System.currentTimeMillis() - started
+                val remaining = (RootOnBootProgress.EXPLOIT_ETA_MS - elapsed).coerceAtLeast(0)
+                running(getString(R.string.boot_stage_exploit), lastLine, remaining)
+                if (accumulated.contains("exploit completed")) {
+                    exploitDone = true
+                }
+            }
+        } catch (_: Exception) {
+            // Stream may be interrupted when zygote kill drops ADB — that's OK
+            // if we already saw the success marker.
+            ""
+        }
+        var exploitSucceeded = exploitDone
+        if (!exploitSucceeded) {
+            val logContent = adb.readLog("/data/local/tmp/f946b.log")
+            exploitSucceeded = logContent.contains("exploit completed")
+        }
+        if (!exploitSucceeded) {
+            // One clean attempt per boot: a burned attempt cannot be repeated
+            // safely, so reboot for a fresh one - bounded by a consecutive
+            // retry budget so a persistently failing state cannot loop
+            // the device forever.
+            val attempts = AppPreferences.bootRetryCount(this) + 1
+            if (attempts <= MAX_BOOT_RETRIES) {
+                AppPreferences.setBootRetryCount(this, attempts)
+                running(
+                    getString(R.string.boot_stage_exploit),
+                    "failed - rebooting to retry ($attempts/$MAX_BOOT_RETRIES)",
+                )
+                runCatching { adb.shell("sync; sleep 2; reboot") }
+                Thread.sleep(20_000) // let adbd drop as the device reboots
+                adb.close()
+                return
+            }
+            error(
+                "Exploit did not succeed this boot and the retry budget is " +
+                    "exhausted ($MAX_BOOT_RETRIES): ${exploitOutput.takeLast(200)}"
+            )
+        }
+        AppPreferences.setBootRetryCount(this, 0)
+
+        // 6. Load KernelSU
+        running(getString(R.string.boot_stage_kernelsu))
+        val lateLoad = adb.shell("$remoteHelper --late-load")
+        check(lateLoad.exitCode == 0) { "KernelSU late-load failed: ${lateLoad.output}" }
+
+        // 7. Module activation is OWNED by the native side (root-daemon
+        // watcher + shell-context stability keeper). The app must not run
+        // ksud stages or kill zygote itself: duplicating the native actors
+        // caused concurrent framework restarts and soft-reboot loops. Wait
+        // for the boot-scoped done marker instead.
+        running(getString(R.string.boot_stage_modules))
+        val deadline = System.currentTimeMillis() + MODULE_WAIT_MS
+        var applied = false
+        while (System.currentTimeMillis() < deadline) {
+            val done = adb.shell(
+                "cat /data/local/tmp/.cve43499-modules-done 2>/dev/null"
+            ).output.trim()
+            val live = adb.shell(
+                "cat /proc/sys/kernel/random/boot_id 2>/dev/null"
+            ).output.trim()
+            if (live.isNotEmpty() && done.startsWith(live)) {
+                applied = true
+                break
+            }
+            // Secondary signal: KernelSU live this boot means the exploit +
+            // late-load succeeded even if the done-marker was lost (e.g. an
+            // apply actor died before recording completion). Accept it after
+            // a grace period instead of reporting a false failure.
+            if (System.currentTimeMillis() - started > KSU_ACTIVE_GRACE_MS &&
+                NativeProbe.isKernelSuActive()
+            ) {
+                applied = true
+                break
+            }
+            Thread.sleep(10_000)
+        }
+        // Root is up and modules applied: leave adbd on stable TCP 5555 so
+        // later sessions skip wireless debugging entirely. Last adb op —
+        // the restart drops this session, which is fine now.
+        runCatching { adb.switchToTcp5555() }
+        adb.close()
+        check(applied) { "Module activation did not complete within ${MODULE_WAIT_MS / 1000}s" }
+    }
+
+    private fun startInForeground() {
+        createChannel()
+        startForegroundCompat(buildNotification(getString(R.string.boot_notification_running)))
+    }
+
+    private fun updateNotification(text: String) {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(NOTIFICATION_ID, buildNotification(text))
+    }
+
+    private fun notifyResult(success: Boolean, message: String) {
+        val manager = getSystemService(NotificationManager::class.java)
+        val builder = baseNotification(message)
+            .setSmallIcon(if (success) android.R.drawable.checkbox_on_background else android.R.drawable.stat_notify_error)
+            .setOngoing(false)
+        manager.notify(NOTIFICATION_ID, builder.build())
+    }
+
+    private fun buildNotification(text: String): Notification =
+        baseNotification(text)
+            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setOngoing(true)
+            .build()
+
+    private fun baseNotification(text: String): NotificationCompat.Builder {
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        val contentIntent = PendingIntent.getActivity(
+            this,
+            0,
+            launchIntent,
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText(text)
+            .setContentIntent(contentIntent)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+    }
+
+    private fun createChannel() {
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            getString(R.string.boot_notification_channel),
+            NotificationManager.IMPORTANCE_LOW,
+        )
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+
+    private fun startForegroundCompat(notification: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    override fun onDestroy() {
+        scope.cancel()
+        super.onDestroy()
+    }
+
+    companion object {
+        private const val CHANNEL_ID = "root_on_boot"
+        private const val NOTIFICATION_ID = 0x524F42
+        private const val MODULE_WAIT_MS = 300_000L
+        private const val MAX_BOOT_RETRIES = 3
+        private const val LEGACY_KSUD_NAME = "ksud-s25u-kdp"
+        /** Wait this long for a fresh done-marker before trusting the
+         * KernelSU-active probe as a success fallback. */
+        private const val KSU_ACTIVE_GRACE_MS = 120_000L
+        /** Upper bound for one full pipeline (connect + staging + exploit +
+         * late-load + module wait). */
+        private const val PIPELINE_WAKELOCK_MS = 20 * 60_000L
+
+        @Volatile
+        private var RUNNING = java.util.concurrent.atomic.AtomicBoolean(false)
+    }
+}

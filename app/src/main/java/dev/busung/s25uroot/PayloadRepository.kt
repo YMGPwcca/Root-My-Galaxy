@@ -34,8 +34,12 @@ class PayloadRepository(private val context: Context) {
         val remote = try {
             fetchRemoteTargets()
         } catch (error: Throwable) {
-            loadTargetsFromCache()
-                ?: throw error // nothing cached: surface the network failure
+            // Fresh OFFLINE install: no cache exists yet. Bundled profiles
+            // alone still allow installing for known devices — only surface
+            // the network failure when there is nothing to install from.
+            loadTargetsFromCache() ?: run {
+                if (bundled.isNotEmpty()) emptyList<TargetProfile>() else throw error
+            }
         }
         // Bundled wins id collisions; remote-only profiles are appended.
         val merged = bundled.associateBy { it.profileId }.toMutableMap()
@@ -145,8 +149,16 @@ class PayloadRepository(private val context: Context) {
     fun extractRootHelper(profile: TargetProfile): File? {
         val assetPath = "artifacts/${profile.profileId}/cve-2026-43499-root"
         return runCatching {
-            val target = File(context.filesDir, "root-helper-${profile.profileId}")
+            // The helper refreshes with the APP, not with the feed: version
+            // the extracted file so an app update always replaces it.
+            val target = File(
+                context.filesDir,
+                "root-helper-${profile.profileId}-v${BuildConfig.VERSION_CODE}",
+            )
             if (!target.isFile || target.length() == 0L) {
+                context.filesDir.listFiles { file ->
+                    file.name.startsWith("root-helper-${profile.profileId}-v")
+                }?.forEach { it.delete() }
                 context.assets.open(assetPath).use { input ->
                     target.outputStream().use { output -> input.copyTo(output) }
                 }

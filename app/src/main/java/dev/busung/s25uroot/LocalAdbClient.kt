@@ -45,6 +45,16 @@ class LocalAdbClient(
     // (the exploit runs up to 15 minutes) cannot corrupt the stream when the
     // caller polls with a timeout.
     private val messageQueue = LinkedBlockingQueue<AdbMessage>()
+
+    /**
+     * Monotonically increasing local stream ids. Reusing id 1 for every
+     * stream made a late CLSE/OKAY from a PREVIOUS stream
+     * indistinguishable from the current one except by timing heuristics;
+     * unique ids let messages be routed by identity instead.
+     */
+    private val lastLocalId = java.util.concurrent.atomic.AtomicInteger(0)
+
+    private fun allocateLocalId(): Int = lastLocalId.incrementAndGet()
     @Volatile private var readerError: Throwable? = null
     private var readerThread: Thread? = null
 
@@ -141,6 +151,19 @@ class LocalAdbClient(
     }
 
     /**
+     * Returns the next ADB message belonging to stream [localId]. Messages
+     * for any other stream are residue from an earlier operation and are
+     * dropped — identity routing, not timing.
+     */
+    private fun nextMessageFor(localId: Int, timeoutMs: Long = 0): AdbMessage {
+        while (true) {
+            val msg = nextMessage(timeoutMs)
+            if (msg.arg1 == localId) return msg
+            Log.d(TAG, "dropping stale message for stream ${msg.arg1} (want $localId)")
+        }
+    }
+
+    /**
      * Drains any messages left over from a previous stream.
      *
      * The ADB transport is a single multiplexed byte stream feeding one shared
@@ -191,9 +214,10 @@ class LocalAdbClient(
     fun requestTcpMode(port: Int): Boolean {
         drainStaleMessages("tcpip")
         Log.i(TAG, "requesting tcpip:$port (adbd will restart)")
+        val localId = allocateLocalId()
         return try {
-            write(A_OPEN, 1, 0, "tcpip:$port")
-            val message = nextMessage()
+            write(A_OPEN, localId, 0, "tcpip:$port")
+            val message = nextMessageFor(localId)
             message.command == A_OKAY
         } catch (t: Throwable) {
             // adbd tears the stream down mid-handshake when it restarts;
@@ -206,7 +230,7 @@ class LocalAdbClient(
      * Executes a shell command and returns the output.
      */
     fun shell(command: String): ShellResult {
-        val localId = 1
+        val localId = allocateLocalId()
         drainStaleMessages("shell")
         Log.d(TAG, "shell: OPEN ${command.take(120)}")
         // The raw ADB `shell:` service does not propagate the command's exit
@@ -215,13 +239,13 @@ class LocalAdbClient(
         // setprop or a failed binary looks like success.
         val wrapped = "sh -c '${command.replace("'", "'\\''")}; echo __ADB_EXIT__=$?'"
         write(A_OPEN, localId, 0, "shell:$wrapped")
-        var message = nextMessage()
+        var message = nextMessageFor(localId)
         val output = StringBuilder()
 
         when (message.command) {
             A_OKAY -> {
                 while (true) {
-                    message = nextMessage()
+                    message = nextMessageFor(localId)
                     val remoteId = message.arg0
                     if (message.command == A_WRTE) {
                         if (message.data != null && message.data.isNotEmpty()) {
@@ -282,11 +306,11 @@ class LocalAdbClient(
         shouldStop: () -> Boolean = { false },
         onOutput: (String) -> Unit,
     ): ShellResult {
-        val localId = 1
+        val localId = allocateLocalId()
         drainStaleMessages("shellStreaming")
         Log.d(TAG, "shellStreaming: OPEN ${command.take(120)}")
         write(A_OPEN, localId, 0, "shell:$command")
-        var message = nextMessage()
+        var message = nextMessageFor(localId)
         val output = StringBuilder()
         val deadline = System.currentTimeMillis() + overallTimeoutMs
         var lastOutputAt = System.currentTimeMillis()
@@ -318,7 +342,7 @@ class LocalAdbClient(
                     // forever. nextMessage never splits a message across
                     // timeouts, so the stream stays intact.
                     message = try {
-                        nextMessage(1000)
+                        nextMessageFor(localId, 1000)
                     } catch (e: SocketTimeoutException) {
                         continue
                     }
@@ -354,11 +378,11 @@ class LocalAdbClient(
      * Pushes a file via the ADB sync protocol.
      */
     fun push(localFile: File, remotePath: String, mode: Int = 0b111101101) {
-        val localId = 1
+        val localId = allocateLocalId()
         drainStaleMessages("push")
         Log.d(TAG, "push: OPEN sync: ${localFile.name} -> $remotePath (${localFile.length()} bytes)")
         write(A_OPEN, localId, 0, "sync:")
-        var message = nextMessage()
+        var message = nextMessageFor(localId)
         if (message.command != A_OKAY) error("Failed to open sync: ${cmdName(message.command)}")
         val remoteId = message.arg0
 
@@ -395,7 +419,7 @@ class LocalAdbClient(
         // already consumed by writeSync is replayed from pendingMessage.
         var sawResult = false
         while (!sawResult) {
-            message = pendingMessage ?: nextMessage()
+            message = pendingMessage ?: nextMessageFor(localId)
             pendingMessage = null
             when (message.command) {
                 A_WRTE -> {
@@ -499,11 +523,25 @@ class LocalAdbClient(
         val arg0 = buf.int
         val arg1 = buf.int
         val dataLength = buf.int
-        buf.int // checksum
-        buf.int // magic
+        val checksum = buf.int
+        val magic = buf.int
+        // Protocol invariants: a malformed or hostile transport must be
+        // REJECTED here, not trusted to resynchronize later.
+        if (magic != command.inv()) {
+            throw IOException("ADB bad magic 0x${magic.toString(16)} for command 0x${command.toString(16)}")
+        }
+        if (dataLength < 0 || dataLength > A_MAXDATA) {
+            throw IOException("ADB absurd data length $dataLength")
+        }
         val data = if (dataLength > 0) {
             val d = ByteArray(dataLength)
             inputStream.readFully(d)
+            // Some vendor adbds ship a zero checksum field; accept that,
+            // but a WRONG non-zero checksum means bit corruption.
+            val actual = d.sumOf { it.toInt() and 0xFF }
+            if (checksum != 0 && checksum != actual) {
+                throw IOException("ADB checksum mismatch: header=$checksum actual=$actual")
+            }
             d
         } else null
         return AdbMessage(command, arg0, arg1, data)

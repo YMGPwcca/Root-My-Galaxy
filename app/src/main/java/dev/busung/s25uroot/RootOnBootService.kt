@@ -282,6 +282,10 @@ class RootOnBootService : Service() {
                 applied = true
                 break
             }
+            // Pace the poll: without this the loop fires two shell round
+            // trips ~10x/second for up to MODULE_WAIT_MS, flooding logcat
+            // and contending with the ksud stages it is waiting for.
+            Thread.sleep(10_000)
         }
         // Root is up and modules applied: leave adbd on stable TCP 5555 so
         // later sessions skip wireless debugging entirely. Last adb op —

@@ -2,6 +2,7 @@ package dev.busung.s25uroot
 
 import android.app.Application
 import android.os.SystemClock
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -194,11 +195,34 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                 val payloads = repository.download(profile) { appendLog("[*] $it") }
                 appendLog(app.getString(R.string.log_download_verified))
 
-                setPhase(InstallPhase.Exploiting, app.getString(R.string.status_exploit_running))
-                executeExploit(payloads.exploit)
+                if (profile.requiresShellContext) {
+                    // Tracefs-class exploits leak kernel memory through
+                    // tracefs, which SELinux only exposes to u:r:shell:s0.
+                    // Bootstrap wireless ADB; the session itself switches
+                    // adbd to stable TCP 5555 and shuts wireless debugging
+                    // down right after, so the whole choreography rides
+                    // loopback and survives Wi-Fi band switches.
+                    appendLog(app.getString(R.string.log_adb_connecting))
+                    WirelessAdbSession.open(app).use { adb ->
+                        appendLog(
+                            if (adb.viaTcp5555) TRANSPORT_STABLE_5555
+                            else TRANSPORT_WIRELESS_DEBUGGING,
+                        )
+                        setPhase(InstallPhase.Exploiting, app.getString(R.string.status_exploit_running))
+                        executeExploitOverAdb(adb, payloads)
 
-                setPhase(InstallPhase.LoadingKernelSu, app.getString(R.string.status_ksu_loading))
-                installKernelSu(payloads)
+                        setPhase(InstallPhase.LoadingKernelSu, app.getString(R.string.status_ksu_loading))
+                        loadKernelSuOverAdb(adb, payloads)
+                    }
+                } else {
+                    // App-context route: the exploit runs directly from the
+                    // app process, no ADB involved at any point.
+                    setPhase(InstallPhase.Exploiting, app.getString(R.string.status_exploit_running))
+                    executeExploit(payloads.exploit)
+
+                    setPhase(InstallPhase.LoadingKernelSu, app.getString(R.string.status_ksu_loading))
+                    installKernelSu(payloads)
+                }
 
                 setPhase(InstallPhase.Installed, app.getString(R.string.status_ksu_active))
                 appendLog(app.getString(R.string.log_install_complete))
@@ -359,6 +383,78 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         if (lateLoad.output.isNotBlank()) appendLog(lateLoad.output)
         storeInstallReceipt()
         appendLog(app.getString(R.string.log_ksu_control_verified))
+    }
+
+    // ---------------------------------------------------------------------
+    // Shell-context route (tracefs-class targets). The whole choreography
+    // runs over one WirelessAdbSession that is already riding stable TCP
+    // 5555 when we get here.
+    // ---------------------------------------------------------------------
+
+    /** Stages and streams the exploit over the ADB session (shell uid). */
+    private suspend fun executeExploitOverAdb(adb: WirelessAdbSession, payloads: VerifiedPayloads) {
+        val profile = payloads.profile
+        val bootToken = currentBootToken()
+        val logPrefix = mutableState.value.log
+
+        adb.remove(SHIZUKU_LOG_PATH)
+        adb.push(payloads.exploit, SHIZUKU_PAYLOAD_PATH, executable = true)
+        val helper = repository.extractRootHelper(profile) ?: nativeHelperFile()
+        adb.push(helper, SHIZUKU_HELPER_PATH, executable = true)
+        appendLog(app.getString(R.string.log_adb_staged))
+
+        val env = buildList {
+            add("EXPLOIT_ATTEMPTS=$EXPLOIT_ATTEMPTS")
+            add("RMG_MANAGER_PACKAGE=${BuildConfig.APPLICATION_ID}")
+            add("P0_ATTEMPT_TIMEOUT_SEC=$P0_ATTEMPT_TIMEOUT_SEC")
+            add("EXPLOIT_ATTEMPT_TIMEOUT_SEC=$EXPLOIT_ATTEMPT_TIMEOUT_SEC")
+            profile.slideSource?.let { add("SLIDE_SOURCE=$it") }
+            cachedP0Offset(bootToken)?.let { add("$P0_OFFSET_ENV=$it") }
+        }.joinToString(" ")
+
+        // Foreground of an open shell: adbd kills a backgrounded process
+        // the moment its shell stream closes. The helper forks the payload
+        // into its own session and streams a live log to stdout, so reading
+        // its stream directly yields real-time progress.
+        var streamed = ""
+        val command = "$env ${SHIZUKU_HELPER_PATH} --run-payload " +
+            "${SHIZUKU_PAYLOAD_PATH} ${SHIZUKU_HELPER_PATH} $SHIZUKU_LOG_PATH"
+        adb.runStreaming(command) { accumulated ->
+            if (accumulated != streamed) {
+                streamed = accumulated
+                cacheP0Offset(bootToken, accumulated)
+                publishExploitLog(logPrefix, accumulated)
+            }
+        }
+
+        val rawLog = streamed.ifBlank { adb.readLog(SHIZUKU_LOG_PATH) }
+        cacheP0Offset(bootToken, rawLog)
+        publishExploitLog(logPrefix, rawLog)
+        require(rawLog.contains("exploit completed")) {
+            app.getString(R.string.error_success_marker)
+        }
+        appendLog(app.getString(R.string.log_bootstrap_root))
+    }
+
+    /** Stages ksud, verifies KernelSU is live, late-loads if it is not. */
+    private fun loadKernelSuOverAdb(adb: WirelessAdbSession, payloads: VerifiedPayloads) {
+        adb.push(payloads.kernelSu, SHIZUKU_KSUD_PATH, executable = true)
+        adb.push(payloads.kernelSu, SHIZUKU_KSUD_STAGE_PATH, executable = true)
+        appendLog(app.getString(R.string.log_ksu_staged))
+
+        val loaded = adb.shell("grep -i kernelsu /proc/modules 2>/dev/null")
+        if (!loaded.output.contains("kernelsu")) {
+            val lateLoad = adb.shell("${SHIZUKU_HELPER_PATH} --late-load")
+            require(lateLoad.exitCode == 0) {
+                app.getString(R.string.error_ksu_verify, lateLoad.exitCode, lateLoad.output)
+            }
+            if (lateLoad.output.isNotBlank()) appendLog(lateLoad.output)
+        } else {
+            appendLog("[+] KernelSU already loaded (supervisor auto-triggered)")
+        }
+        storeInstallReceipt()
+        appendLog(app.getString(R.string.log_ksu_control_verified))
+        AdbKeyManager(app) // ensure key material exists for root-on-boot
     }
 
     private fun detectInstalled(): Boolean {
@@ -560,6 +656,8 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         private const val P0_OFFSET_MAX = 0x1f0000L
         private const val P0_OFFSET_MASK = 0xffffL
         private const val SHIZUKU_LOG_PATH = "/data/local/tmp/ksu-exploit.log"
+        private const val TRANSPORT_STABLE_5555 = "[*] transport: stable adbTCP 127.0.0.1:5555"
+        private const val TRANSPORT_WIRELESS_DEBUGGING = "[*] transport: wireless debugging (dynamic port)"
         private const val SHIZUKU_HELPER_PATH = "/data/local/tmp/ksu-helper"
         private const val SHIZUKU_PAYLOAD_PATH = "/data/local/tmp/ksu-payload"
         private const val SHIZUKU_KSUD_PATH = "/data/local/tmp/ksud-s25u-kdp"

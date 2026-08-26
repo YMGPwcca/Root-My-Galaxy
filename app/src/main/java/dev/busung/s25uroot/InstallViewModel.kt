@@ -430,7 +430,11 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         val rawLog = streamed.ifBlank { adb.readLog(SHIZUKU_LOG_PATH) }
         cacheP0Offset(bootToken, rawLog)
         publishExploitLog(logPrefix, rawLog)
-        require(rawLog.contains("exploit completed")) {
+        // The ADB bootstrap path is shell-uid with no in-app sanity
+        // check between exploit stdout and a finished root: require
+        // the same two markers the app-uid route requires, so a
+        // partially-applied run can't masquerade as success.
+        require(rawLog.contains("exploit completed") && rawLog.contains("done=1 root=1")) {
             app.getString(R.string.error_success_marker)
         }
         appendLog(app.getString(R.string.log_bootstrap_root))

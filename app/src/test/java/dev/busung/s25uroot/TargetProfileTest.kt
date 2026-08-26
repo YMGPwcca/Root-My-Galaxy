@@ -23,42 +23,9 @@ class TargetProfileTest {
     @Test
     fun firmwarePinnedProfileRejectsOtherFirmwareBuilds() {
         // Model + kernel alone must NOT select a payload whose kernel
-        // offsets were built for one specific firmware build.
-        val pinned = profile.copy(
-            models = setOf("SM-S911B"),
-            kernelVersions = setOf("5.15.189"),
-            firmwares = setOf("S911BXXU9FZDP"),
-        )
-        assertTrue(
-            pinned.matches(
-                snapshot(
-                    "SM-S911B",
-                    "5.15.189",
-                    fingerprint = "samsung/dm1qdm1q/16/BP4A.251205.006/S911BXXU9FZDP/dm1q:16/user/release-keys",
-                ),
-            ),
-        )
-        assertFalse(
-            pinned.matches(
-                snapshot(
-                    "SM-S911B",
-                    "5.15.189",
-                    fingerprint = "samsung/dm1qdm1q/16/BP4A.250305.005/S911BXXU6FYD8/dm1q:16/user/release-keys",
-                ),
-            ),
-        )
-    }
-
-    @Test
-    fun rejectsUnlistedModelOrKernelVersion() {
-        assertFalse(profile.matches(snapshot("SM-S928B", "6.6.98-android15-8-build")))
-    }
-
-    @Test
-    fun matchesSamsungBuildWithUserSuffix() {
-        // Real Samsung fingerprint uses "BUILD:USER" as the build segment
-        // (e.g. "S911BXXU9FZDP:user"), not just "BUILD". The matching
-        // path must split on ':' so the BUILD portion compares cleanly.
+        // offsets were built for one specific firmware build. The match
+        // is on the Samsung firmware tag (ro.boot.bootloader /
+        // ro.build.PDA) — not the fingerprint.
         val pinned = profile.copy(
             models = setOf("SM-S911B"),
             kernelVersions = setOf("5.15.189"),
@@ -69,16 +36,38 @@ class TargetProfileTest {
                 snapshot(
                     "SM-S911B",
                     "5.15.189-android13-8-33413713-abS911BXXU9FZDP",
-                    fingerprint = "samsung/dm1qxxx/dm1q:16/BP4A.251205.006/S911BXXU9FZDP:user/release-keys",
+                    firmwareTag = "S911BXXU9FZDP",
                 ),
             ),
         )
-     }
+        assertFalse(
+            pinned.matches(
+                snapshot(
+                    "SM-S911B",
+                    "5.15.189-android13-8-33413713-abS911BXXU6FYD8",
+                    firmwareTag = "S911BXXU6FYD8",
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun emptyFirmwareSetAcceptsAnyBuild() {
+        // Profiles without a firmwares[] constraint keep matching on
+        // model + kernel alone — the same contract the app shipped
+        // before firmware pinning was introduced.
+        assertTrue(profile.matches(snapshot("SM-S931B", "6.6.98-android15-8-build", firmwareTag = "S931BXXU6ABC1")))
+    }
+
+    @Test
+    fun rejectsUnlistedModelOrKernelVersion() {
+        assertFalse(profile.matches(snapshot("SM-S928B", "6.6.98-android15-8-build")))
+    }
 
     private fun snapshot(
         model: String,
         kernelRelease: String,
-        fingerprint: String = "samsung/example",
+        firmwareTag: String = "",
     ) = DeviceSnapshot(
         manufacturer = "samsung",
         model = model,
@@ -87,7 +76,8 @@ class TargetProfileTest {
         kernelVersionInfo = "#1 SMP PREEMPT",
         machine = "aarch64",
         buildId = "BP4A.251205.006.S938BCZG1",
-        fingerprint = fingerprint,
+        fingerprint = "samsung/example",
+        firmwareTag = firmwareTag,
         androidRelease = "16",
         sdk = 36,
         abi = "arm64-v8a",

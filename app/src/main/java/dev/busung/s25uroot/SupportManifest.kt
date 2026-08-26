@@ -69,15 +69,13 @@ data class TargetProfile(
      * never run on a different build just because model and kernel match.
      */
     fun matchesFirmware(snapshot: DeviceSnapshot): Boolean =
-        firmwares.isEmpty() || firmwares.any { wanted ->
-            // Segment-bounded: the firmware tag is one /-delimited
-            // fingerprint segment, with a /-or-: delimiter. Samsung's
-            // build segment has the form "BUILD:USER" (e.g.
-            // "S911BXXU9FZDP:user"), so we also split on ':' to isolate
-            // the BUILD portion. Substring matching would let a short or
-            // generic tag (e.g. "S911B") match ANY build of the model.
-            snapshot.fingerprint.split('/', ':').any { it.equals(wanted, ignoreCase = true) }
-        }
+        // The app only ships Samsung payloads, and Samsung's firmware
+        // build tag is exposed cleanly via ro.boot.bootloader /
+        // ro.build.PDA — no fingerprint parsing, no prefix-collision
+        // surface. Empty set on the profile = no firmware constraint.
+        firmwares.isEmpty() ||
+            firmwares.any { it.equals(snapshot.firmwareTag, ignoreCase = true) }
+
 
     fun matches(snapshot: DeviceSnapshot): Boolean =
         matchesDevice(snapshot) && matchesKernelVersion(snapshot) && matchesFirmware(snapshot)

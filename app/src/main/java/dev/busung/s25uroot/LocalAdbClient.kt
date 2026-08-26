@@ -486,12 +486,10 @@ class LocalAdbClient(
         error("Sync write not acknowledged after 8 interleaved messages")
     }
 
-    private fun signToken(token: ByteArray): ByteArray {
-        val sig = Signature.getInstance("SHA1withRSA")
-        sig.initSign(keyManager.privateKey)
-        sig.update(token)
-        return sig.sign()
-    }
+    internal fun signToken(token: ByteArray): ByteArray =
+        signToken(keyManager.privateKey, token)
+
+
 
     private data class AdbMessage(
         val command: Int,
@@ -577,6 +575,25 @@ class LocalAdbClient(
     data class ShellResult(val exitCode: Int, val output: String)
 
     companion object {
+
+        /**
+         * Signs an adbd auth token the way adbd verifies it: BoringSSL
+         * RSA_verify(NID_sha1, token) treats the raw 20-byte token AS the
+         * digest, so we build DigestInfo(SHA-1) around it and apply
+         * RSASSA-PKCS1-v1_5 via NONEwithRSA. "SHA1withRSA" would hash the
+         * token a SECOND time and never verify. Static so tests can prove
+         * the format by raw modular math without a device connection.
+         */
+        internal fun signToken(privateKey: java.security.PrivateKey, token: ByteArray): ByteArray {
+            val digestInfo = byteArrayOf(
+                0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03,
+                0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
+            ) + token
+            val sig = Signature.getInstance("NONEwithRSA")
+            sig.initSign(privateKey)
+            sig.update(digestInfo)
+            return sig.sign()
+        }
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val READ_TIMEOUT_MS = 120_000
         private const val HEADER_SIZE = 24

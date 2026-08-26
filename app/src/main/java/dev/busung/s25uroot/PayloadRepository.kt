@@ -125,12 +125,22 @@ class PayloadRepository(private val context: Context) {
     private fun loadTargetsFromCache(): List<TargetProfile>? = runCatching {
         val file = manifestCacheFile
         if (!file.isFile) return null
-        val profiles = SupportManifest.parse(file.readBytes()).targets
-        val commit = File(context.filesDir, CACHE_COMMIT_FILE)
-            .takeIf { it.isFile }
+        val bytes = file.readBytes()
+        val profiles = SupportManifest.parse(bytes).targets
+        val commitFile = File(context.filesDir, CACHE_COMMIT_FILE)
+        val commit = commitFile.takeIf { it.isFile }
             ?.readText(Charsets.US_ASCII)
             ?.trim()
-        if (commit == null || !commit.matches(Regex("[0-9a-f]{40}"))) return profiles
+            ?.takeIf { it.matches(Regex("[0-9a-f]{40}")) }
+        if (commit == null) {
+            // No valid pinned commit (first-run cache, or the commit file
+            // was lost). Synthesize a stable revision from the manifest
+            // bytes so a successful fetchRemoteTargets can later
+            // OVERWRITE it and discardStaleStaging has a marker to act on.
+            val fallback = "cache-" + sha256Hex(bytes).take(16)
+            commitFile.writeText(fallback, Charsets.US_ASCII)
+            return profiles.map { it.copy(sourceRevision = fallback) }
+        }
         profiles.map { profile ->
             profile.copy(
                 exploit = pinArtifact(profile.exploit, commit),
@@ -139,6 +149,11 @@ class PayloadRepository(private val context: Context) {
             )
         }
     }.getOrNull()
+
+    private fun sha256Hex(bytes: ByteArray): String {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        return md.digest(bytes).joinToString("") { "%02x".format(it) }
+    }
 
     private val manifestCacheFile: File
         get() = File(context.filesDir, "cached-targets-v3.json")

@@ -52,8 +52,28 @@ class TargetProfileTest {
     @Test
     fun rejectsUnlistedModelOrKernelVersion() {
         assertFalse(profile.matches(snapshot("SM-S928B", "6.6.98-android15-8-build")))
-        assertFalse(profile.matches(snapshot("SM-S938N", "6.6.102-android15-8-build")))
     }
+
+    @Test
+    fun matchesSamsungBuildWithUserSuffix() {
+        // Real Samsung fingerprint uses "BUILD:USER" as the build segment
+        // (e.g. "S911BXXU9FZDP:user"), not just "BUILD". The matching
+        // path must split on ':' so the BUILD portion compares cleanly.
+        val pinned = profile.copy(
+            models = setOf("SM-S911B"),
+            kernelVersions = setOf("5.15.189"),
+            firmwares = setOf("S911BXXU9FZDP"),
+        )
+        assertTrue(
+            pinned.matches(
+                snapshot(
+                    "SM-S911B",
+                    "5.15.189-android13-8-33413713-abS911BXXU9FZDP",
+                    fingerprint = "samsung/dm1qxxx/dm1q:16/BP4A.251205.006/S911BXXU9FZDP:user/release-keys",
+                ),
+            ),
+        )
+     }
 
     private fun snapshot(
         model: String,

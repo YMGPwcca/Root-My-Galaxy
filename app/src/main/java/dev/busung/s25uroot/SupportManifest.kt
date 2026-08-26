@@ -71,9 +71,12 @@ data class TargetProfile(
     fun matchesFirmware(snapshot: DeviceSnapshot): Boolean =
         firmwares.isEmpty() || firmwares.any { wanted ->
             // Segment-bounded: the firmware tag is one /-delimited
-            // fingerprint segment. Substring matching would let a short or
+            // fingerprint segment, with a /-or-: delimiter. Samsung's
+            // build segment has the form "BUILD:USER" (e.g.
+            // "S911BXXU9FZDP:user"), so we also split on ':' to isolate
+            // the BUILD portion. Substring matching would let a short or
             // generic tag (e.g. "S911B") match ANY build of the model.
-            snapshot.fingerprint.split('/').any { it.equals(wanted, ignoreCase = true) }
+            snapshot.fingerprint.split('/', ':').any { it.equals(wanted, ignoreCase = true) }
         }
 
     fun matches(snapshot: DeviceSnapshot): Boolean =

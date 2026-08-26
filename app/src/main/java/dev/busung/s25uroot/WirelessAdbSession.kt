@@ -232,7 +232,12 @@ class WirelessAdbSession private constructor(
             } catch (e: SocketTimeoutException) {
                 false // adbd kept re-challenging: key not authorized
             } catch (t: Throwable) {
-                false // TLS rejection / transport gone: not trusted
+                // TLS handshake failure / transport reset / adbd gone —
+                // not the same as "untrusted key". Treating those as
+                // false would make the pairing card flip to "untrusted"
+                // on a transient network blip. Report inconclusive so
+                // the caller keeps the last-known verdict.
+                null
             }
         }
 

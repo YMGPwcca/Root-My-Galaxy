@@ -71,9 +71,10 @@ class Spake2(private val password: ByteArray) {
         w = passwordToScalar(passwordHash)
 
         // T = x*B + w*M
-        val xB = ed25519ScalarMult(x, BASE_POINT)
-        val wM = ed25519ScalarMult(w, mPoint)
-        ourMessage = ed25519PointAdd(xB, wM)
+        val xB = ed25519ScalarMult(x, BASE_POINT)!!
+        val wM = ed25519ScalarMult(w, mPoint)!!
+        // xB/wM derive from trusted constants; the add cannot fail here.
+        ourMessage = ed25519PointAdd(xB, wM)!!
         Log.d(TAG, "init: T=${ourMessage.toHex().take(16)}...")
     }
 
@@ -83,12 +84,25 @@ class Spake2(private val password: ByteArray) {
             return false
         }
 
-        // K = x * (S - w*N)
-        val wN = ed25519ScalarMult(w, nPoint)
-        val negWN = wN.copyOf()
-        negWN[31] = (negWN[31].toInt() xor 0x80).toByte() // negate point
-        val sMinusWN = ed25519PointAdd(theirMsg, negWN)
-        val k = ed25519ScalarMult(x, sMinusWN)
+        // K = x * (S - w*N). theirMsg is UNTRUSTED: an undecodable or
+        // off-curve point (or a degenerate den==0 encoding) must make the
+        // exchange fail cleanly, never throw.
+        val k = try {
+            val wN = ed25519ScalarMult(w, nPoint) ?: return false.also {
+                Log.e(TAG, "invalid point in scalar mult")
+            }
+            val negWN = wN.copyOf()
+            negWN[31] = (negWN[31].toInt() xor 0x80).toByte() // negate point
+            val sMinusWN = ed25519PointAdd(theirMsg, negWN) ?: return false.also {
+                Log.e(TAG, "peer message is not a valid curve point")
+            }
+            ed25519ScalarMult(x, sMinusWN) ?: return false.also {
+                Log.e(TAG, "invalid point in scalar mult")
+            }
+        } catch (e: ArithmeticException) {
+            Log.e(TAG, "degenerate point rejected: ${e.message}")
+            return false
+        }
 
         // transcript = SHA512( len||clientName || len||serverName || len||T || len||S
         //                      || len||K || len||password_hash )
@@ -147,15 +161,15 @@ class Spake2(private val password: ByteArray) {
     }
 
     // --- Ed25519 scalar multiplication (double-and-add) ---
-    private fun ed25519ScalarMult(scalar: ByteArray, point: ByteArray): ByteArray {
+    private fun ed25519ScalarMult(scalar: ByteArray, point: ByteArray): ByteArray? {
         val k = BigInteger(1, scalar.reversedArray())
         if (k == BigInteger.ZERO) return IDENTITY_POINT
         var result = IDENTITY_POINT
         var addend = point
         var bits = k
         while (bits > BigInteger.ZERO) {
-            if (bits.testBit(0)) result = ed25519PointAdd(result, addend)
-            addend = ed25519PointAdd(addend, addend)
+            if (bits.testBit(0)) result = ed25519PointAdd(result, addend) ?: return null
+            addend = ed25519PointAdd(addend, addend) ?: return null
             bits = bits.shiftRight(1)
         }
         return result
@@ -163,9 +177,9 @@ class Spake2(private val password: ByteArray) {
 
     // --- Ed25519 point addition in affine coordinates ---
     // Curve: -x^2 + y^2 = 1 + d*x^2*y^2, p = 2^255 - 19
-    private fun ed25519PointAdd(p: ByteArray, q: ByteArray): ByteArray {
-        val (x1, y1) = decompress(p)
-        val (x2, y2) = decompress(q)
+    private fun ed25519PointAdd(p: ByteArray, q: ByteArray): ByteArray? {
+        val (x1, y1) = decompress(p) ?: return null
+        val (x2, y2) = decompress(q) ?: return null
         val dxy = ED25519_D.multiply(x1).multiply(x2).multiply(y1).multiply(y2).mod(FIELD_P)
         val x3num = x1.multiply(y2).add(y1.multiply(x2)).mod(FIELD_P)
         val x3den = BigInteger.ONE.add(dxy).mod(FIELD_P).modInverse(FIELD_P)
@@ -176,17 +190,25 @@ class Spake2(private val password: ByteArray) {
         return compress(x3, y3)
     }
 
-    private fun decompress(encoded: ByteArray): Pair<BigInteger, BigInteger> {
+    internal fun decompress(encoded: ByteArray): Pair<BigInteger, BigInteger>? {
         val yBytes = encoded.copyOf()
         val sign = (yBytes[31].toInt() shr 7) and 1
         yBytes[31] = (yBytes[31].toInt() and 0x7F).toByte()
         val y = BigInteger(1, yBytes.reversedArray())
+        // Non-canonical encodings (y >= p) are rejected by BoringSSL's
+        // x25519_ge_frombytes_vartime; mirror that instead of silently
+        // reducing mod p.
+        if (y >= FIELD_P) return null
         val y2 = y.multiply(y).mod(FIELD_P)
         val num = y2.subtract(BigInteger.ONE).mod(FIELD_P)
         val den = ED25519_D.multiply(y2).add(BigInteger.ONE).mod(FIELD_P)
         val x2 = num.multiply(den.modInverse(FIELD_P)).mod(FIELD_P)
         var x = x2.modPow(FIELD_P.add(BigInteger.valueOf(3)).divide(BigInteger.valueOf(8)), FIELD_P)
         if (x.multiply(x).mod(FIELD_P) != x2) x = x.multiply(SQRT_M1).mod(FIELD_P)
+        // The recovered candidate can still fail the curve equation on
+        // garbage input — reject it instead of feeding a bogus point into
+        // scalar multiplication.
+        if (x.multiply(x).mod(FIELD_P) != x2) return null
         if (x.testBit(0) != (sign == 1)) x = FIELD_P.subtract(x)
         return Pair(x, y)
     }
@@ -233,8 +255,8 @@ class Spake2(private val password: ByteArray) {
         private val BASE_POINT = hexToBytes(
             "5866666666666666666666666666666666666666666666666666666666666666"
         )
-        private val FIELD_P = BigInteger.TWO.pow(255).subtract(BigInteger.valueOf(19))
-        private val ED25519_D = BigInteger("-121665").multiply(
+        internal val FIELD_P = BigInteger.TWO.pow(255).subtract(BigInteger.valueOf(19))
+        internal val ED25519_D = BigInteger("-121665").multiply(
             BigInteger("121666").modInverse(FIELD_P)
         ).mod(FIELD_P)
         private val SQRT_M1 = BigInteger("2").modPow(

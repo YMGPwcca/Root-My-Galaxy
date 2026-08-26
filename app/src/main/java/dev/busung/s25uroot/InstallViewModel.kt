@@ -862,7 +862,11 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
         private const val SU_TIMEOUT_MS = 90_000L
         private const val SU_CHECK_TIMEOUT_MS = 20_000L
         private const val STAGE_FIRE_TIMEOUT_MS = 10_000L
-        private const val MODULE_WAIT_MILLIS = 90_000L
+        // Worst case is 3 stages of ~60s of native work, so cap at 200s
+    // to give the exploit a chance to actually finish without false
+    // "module never came up" errors. The runSu watchdog bounds timeouts
+    // separately at 90s.
+    private const val MODULE_WAIT_MILLIS = 200_000L
         private const val APPLY_LOG_TAG = "RmgApply"
         private const val SHIZUKU_HELPER_PATH = "/data/local/tmp/ksu-helper"
         private const val SHIZUKU_PAYLOAD_PATH = "/data/local/tmp/ksu-payload"

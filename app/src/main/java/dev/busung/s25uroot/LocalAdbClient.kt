@@ -226,15 +226,19 @@ class LocalAdbClient(
             write(A_OPEN, localId, 0, "tcpip:$port")
             val message = nextMessageFor(localId)
             message.command == A_OKAY
+        } catch (e: java.net.SocketTimeoutException) {
+            // adbd stalled: treat as failure, not as the expected
+            // mid-handshake stream tear-down. The caller will surface a
+            // proper diagnostic instead of waiting for a 5555 listener
+            // that will never come up.
+            Log.w(TAG, "tcpip: timed out (${e.message ?: "no adbd response"})")
+            false
         } catch (e: IOException) {
             // adbd tears the stream down mid-handshake when it restarts;
-            // that is expected and usually means success.
+            // that is expected and means success.
             Log.d(TAG, "tcpip: stream ended (${e.javaClass.simpleName})")
             true
         } catch (t: Throwable) {
-            // Anything else is a real protocol/transport error: reporting
-            // success here would make the caller wait for a 5555 listener
-            // that will never come up.
             Log.w(TAG, "tcpip: unexpected error (${t.javaClass.simpleName}: ${t.message})")
             false
         }

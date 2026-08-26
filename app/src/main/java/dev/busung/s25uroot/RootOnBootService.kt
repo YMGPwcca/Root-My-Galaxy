@@ -57,14 +57,21 @@ class RootOnBootService : Service() {
         scope.launch {
             try {
                 val result = runCatching { runRootOnBoot() }
-                val message = result.fold(
-                    onSuccess = { getString(R.string.boot_notification_success) },
-                    onFailure = {
-                        getString(R.string.boot_notification_failed, it.message ?: it.javaClass.simpleName)
-                    },
-                )
-                RootOnBootProgress.update(RootOnBootState.Done(result.isSuccess, message))
-                notifyResult(result.isSuccess, message)
+                val retry = result.exceptionOrNull() as? RebootRetry
+                val success = result.isSuccess
+                val message = when {
+                    result.isSuccess -> getString(R.string.boot_notification_success)
+                    // Rebooting into a retry is NOT success: report it as
+                    // its own outcome so a rebooting unrooted device never
+                    // shows the success notification.
+                    retry != null -> getString(R.string.boot_notification_retry, retry.attempt, MAX_BOOT_RETRIES)
+                    else -> getString(
+                        R.string.boot_notification_failed,
+                        result.exceptionOrNull()?.message ?: result.exceptionOrNull()?.javaClass?.simpleName ?: "unknown",
+                    )
+                }
+                RootOnBootProgress.update(RootOnBootState.Done(success, message))
+                notifyResult(success, message)
             } finally {
                 // Guaranteed cleanup: the guard flag and the foreground
                 // state must reset even if the coroutine is cancelled.
@@ -75,6 +82,10 @@ class RootOnBootService : Service() {
         }
         return START_NOT_STICKY
     }
+
+    /** Distinguishes "rebooting into a bounded retry" from real success. */
+    private class RebootRetry(val attempt: Int) :
+        RuntimeException("rebooting to retry ($attempt/$MAX_BOOT_RETRIES)")
 
     private fun runRootOnBoot() {
         // The exploit choreography is timing-sensitive: a suspended SoC
@@ -248,8 +259,10 @@ class RootOnBootService : Service() {
                         "- not rebooting into an unbounded retry"
                 }
                 Thread.sleep(20_000) // let adbd drop as the device reboots
-                adb.close()
-                return
+                // Normal return would report SUCCESS to the caller while
+                // the device reboots unrooted — make the retry outcome
+                // explicit and distinguishable.
+                throw RebootRetry(attempts)
             }
             error(
                 "Exploit did not succeed this boot and the retry budget is " +

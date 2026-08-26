@@ -25,6 +25,7 @@ import java.io.Closeable
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.math.BigInteger
+import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -75,8 +76,14 @@ class AdbPairingClient(
 
     private fun setupTlsConnection() {
         Log.d(TAG, "Connecting to $host:$port")
-        socket = Socket(host, port)
-        socket.tcpNoDelay = true
+        // Bounded connect + bounded IO: a black-holed pairing port must
+        // fail within ~25s instead of stalling the foreground service on
+        // OS-default timeouts (connect ~2min, reads infinite).
+        socket = Socket().apply {
+            connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+            tcpNoDelay = true
+            soTimeout = IO_TIMEOUT_MS
+        }
 
         // BouncyCastle TLS 1.3 client — no hidden API issues
         val crypto = BcTlsCrypto(SecureRandom())
@@ -245,11 +252,16 @@ class AdbPairingClient(
     }
 
     override fun close() {
-        try { protocol.close() } catch (_: Throwable) {}
-        try { socket.close() } catch (_: Exception) {}
+        // setupTlsConnection() can throw before either field is assigned;
+        // lateinit reads here would mask the original error with an
+        // UninitializedPropertyAccessException.
+        if (::protocol.isInitialized) runCatching { protocol.close() }
+        if (::socket.isInitialized) runCatching { socket.close() }
     }
 
     companion object {
+        private const val CONNECT_TIMEOUT_MS = 10_000
+        private const val IO_TIMEOUT_MS = 15_000
         private const val PAIRING_TYPE_SPAKE2: Byte = 0
         private const val PAIRING_TYPE_PEER_INFO: Byte = 1
     }

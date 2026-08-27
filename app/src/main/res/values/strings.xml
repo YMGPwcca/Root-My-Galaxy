@@ -207,7 +207,7 @@
 <string name="pref_auto_root_boot">Auto-root on boot</string>
 <string name="pref_auto_root_boot_summary">Re-apply root and KernelSU automatically after reboot via local wireless ADB</string>
 <string name="pref_adb_pairing">Wireless ADB pairing</string>
-<string name="pref_adb_pairing_summary">Pair with this device\u2019s wireless debugging for root-on-boot</string>
+<string name="pref_adb_pairing_summary">Use Wireless ADB only to bootstrap TCP 5555, then use TCP for improved reliability.</string>
 <string name="adb_pair_title">Pair with Wireless Debugging</string>
 <string name="adb_pair_instructions">Enable Wireless Debugging in Developer Options, then tap Pair. A notification will appear asking for the pairing code — open \u201cPair device with pairing code\u201d in Wireless Debugging and type the 6-digit code into the notification.</string>
 <string name="adb_pair_code_hint">Pairing code</string>
